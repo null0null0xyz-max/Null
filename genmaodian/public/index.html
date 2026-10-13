@@ -56,6 +56,11 @@ a{color:#0645ad;text-decoration:none}
 .badges span{background:#fff;color:#e60012;font-weight:700;font-size:12px;padding:2px 8px;border-radius:12px;border:1px solid #ffd800}
 #bigDl{display:flex;align-items:center;justify-content:center;gap:12px;width:100%;max-width:520px;margin:0 auto;min-height:110px;border:4px solid #fff;border-radius:16px;background:linear-gradient(#3ee66a,#0aa83a 55%,#078a2f);color:#fff;font-size:40px;font-weight:900;cursor:pointer;text-shadow:0 2px 0 #05601f;box-shadow:0 6px 0 #05601f,0 0 30px #fff200;animation:bounce 1.2s infinite}
 #bigDl:active{transform:translateY(4px);box-shadow:0 2px 0 #05601f}
+.plats{display:flex;gap:10px;justify-content:center;flex-wrap:wrap;margin:10px auto 0;max-width:520px}
+.plat{flex:1 1 180px;display:flex;flex-direction:column;align-items:center;gap:2px;padding:10px 8px;border:2px solid #fff;border-radius:12px;background:#ffffff22;color:#fff;font-size:22px;cursor:pointer;text-shadow:0 1px 0 #0006}
+.plat b{font-size:17px}
+.plat small{font-size:11px;opacity:.92;font-weight:700}
+.plat.off{opacity:.55;cursor:not-allowed;border-style:dashed}
 #bigDl svg{width:60px;height:60px}
 @keyframes bounce{50%{transform:scale(1.04)}}
 .stats{display:flex;justify-content:center;gap:16px;flex-wrap:wrap;color:#fff;font-weight:700;margin-top:12px;font-size:13px}
@@ -131,6 +136,10 @@ a{color:#0645ad;text-decoration:none}
 <div class="sub" data-t="sub">无捆绑 · 无病毒 · 无广告插件 · 满速下载</div>
 <div class="badges"><span data-t="bd1">✔ 官方认证</span><span data-t="bd2">✔ 360安全</span><span data-t="bd3">✔ 绿色版</span><span data-t="bd4">✔ 永久免费</span></div>
 <button id="bigDl"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12"/><path d="M6 10l6 6 6-6"/><path d="M4 20h16"/></svg><span data-t="dl">立即下载</span></button>
+<div class="plats">
+<button class="plat" id="dlWin">🪟 <b data-t="pwin">Windows</b><small data-t="pwok">可用 · 立即下载</small></button>
+<button class="plat off" id="dlAnd" disabled>🤖 <b data-t="pand">Android</b><small data-t="psoon">暂不可用 · 即将推出</small></button>
+</div>
 <div class="stats"><span><span data-t="st1">今日下载</span> <b id="cnt">38,542</b></span><span><span data-t="st2">好评率</span> <b>99.8%</b></span><span><span data-t="st3">大小</span> <b>1.1MB</b></span><span><span data-t="st4">版本</span> <b>v2.0</b></span></div>
 </div>
 
@@ -177,7 +186,7 @@ a{color:#0645ad;text-decoration:none}
 <div class="box"><h3><span data-t="faq">❓ 常见问题</span></h3><ul>
 <li>❓ <b data-t="q1">如何获取下载密钥？</b><br><span data-t="a1">打开 Telegram 机器人，点击开始即可获得。</span></li>
 <li>❓ <b data-t="q2">下载需要付费吗？</b><br><span data-t="a2">完全免费，无任何隐藏费用。</span></li>
-<li>❓ <b data-t="q3">支持哪些系统？</b><br><span data-t="a3">Windows、Mac、Android、iOS 全平台支持。</span></li>
+<li>❓ <b data-t="q3">支持哪些系统？</b><br><span data-t="a3">目前支持 Windows，Android 即将推出。</span></li>
 </ul></div>
 </main>
 
@@ -193,7 +202,7 @@ a{color:#0645ad;text-decoration:none}
 </ul></div>
 <a class="ad ad3" data-t="ad3">💰 邀请好友 赢大奖 💰</a>
 <div class="box"><h3><span data-t="info">ℹ️ 软件信息</span></h3><ul>
-<li><span data-t="i1">语言：简体中文 / English</span></li><li><span data-t="i2">授权：免费</span></li><li><span data-t="i3">系统：Win / Mac / Android / iOS</span></li><li><span data-t="i4">更新：2026-10-13</span></li><li><span data-t="i5">评分：★★★★★</span></li>
+<li><span data-t="i1">语言：简体中文 / English</span></li><li><span data-t="i2">授权：免费</span></li><li><span data-t="i3">系统：Windows（Android 即将推出）</span></li><li><span data-t="i4">更新：2026-10-13</span></li><li><span data-t="i5">评分：★★★★★</span></li>
 </ul></div>
 </aside>
 </div>
@@ -227,7 +236,7 @@ a{color:#0645ad;text-decoration:none}
 var BOT_URL = "https://t.me/chdownloadibot"; // замените на https://t.me/ВашБот
 var T = {
 zh:{howTo:"打开我们的 Telegram 机器人并发送命令 /download。机器人会回复一篇文章——阅读后点击“同意”接收 ZIP，或点击“拒绝”取消。",kph:"粘贴你的密钥",sph:"搜索软件、游戏、资源…",err:"密钥无效或已过期，请从机器人获取新密钥。",hello:"欢迎，用户 ",dl2:"下载",regW:"下载前需要注册，只需 1 分钟！"},
-en:{home:"Home",fav:"Bookmark",app:"Mobile",new:"● New version!",reg:"Register",slogan:"Official · Ultra-fast · Safe",sbtn:"Search",sph:"Search software, games, files…",hotw:"Trending: ",n1:"Home",n2:"Software",n3:"Games",n4:"Mobile",n5:"Top charts",n6:"Topics",n7:"News",n8:"Forum",mq:"📢 Over 1,000,000 users on 根锚点下载! 🔥 New users get the fast lane 🔥 Verified · No adware · One-click download 🎉 38,542 downloads today 🎉",cat:"Categories",c1:"System tools",c2:"Games",c3:"Media players",c4:"Messaging",c5:"Security",c6:"Graphics",c7:"Office & study",c8:"Network",ad1:"🎁 Register, get 7 days VIP 🎁",news:"Notices",nw1:"Server upgrade done",nw2:"Invite friends, earn points",nw3:"v2.0 released",nw4:"Beware of fake sites",okbar:"✅ Signed in, ready to download",h1:"🔥 根锚点 Latest Official Version, Free 🔥",sub:"No bundles · No viruses · No adware · Full speed",bd1:"✔ Verified",bd2:"✔ Virus-free",bd3:"✔ Portable",bd4:"✔ Free forever",dl:"DOWNLOAD",st1:"Today",st2:"Rating",st3:"Size",st4:"Version",rec:"🔥 Hot picks",m1:"Fast",m2:"VIP",m3:"Toolkit",m4:"Full",get:"Get",ad2:"⚡ High-speed lane · 10× faster ⚡",cm:"💬 Comments",cmn:"(2,381)",cm1:"Super fast download! 👍",cm2:"Signing up via Telegram took a minute.",cm3:"Been using it for years.",cm4:"Honest site, no bundled junk ❤",rank:"📊 Top downloads",r1:"根锚点 Official",r2:"根锚点 Fast",r3:"根锚点 Portable",r4:"Resource pack 2026",r5:"Tool collection",r6:"Plugin pack",r7:"Theme pack",ad3:"💰 Invite friends, win prizes 💰",info:"ℹ️ Info",i1:"Language: Chinese / English",i2:"License: Free",i3:"OS: Win / Mac / Android / iOS",i4:"Updated: 2026-10-13",i5:"Rating: ★★★★★",f1:"About",f2:"Contact",f3:"Disclaimer",f4:"Sitemap",f5:"© 2026 根锚点下载",kf:"Support",dl2:"Download",totop:"↑Top",regT:"⚠ Please register / sign in",regW:"Registration is required to download. Takes 1 minute!",s1:"Open our Telegram bot",s2:"Press Start",s3:"The bot sends you a personal key",s4:"Paste the key below",openBot:"✈ Open Telegram bot",kph:"Paste your key",signIn:"Register / Sign in",err:"Invalid or expired key. Get a fresh key from the bot.",dlT:"📦 Get the archive",howTo:"Open our Telegram bot and send /download. The bot replies with an article — read it, then tap Agree to receive the ZIP, or Decline to cancel.",copyOpen:"Open bot & copy /download",close:"Close",signOut:"Sign out",hello:"Hi, user ",ad4:"🛡️ Full HTTPS encryption · Safer downloads 🛡️",feat:"✨ Features",fe1:"Fast download",fe2:"Virus-free",fe3:"Free forever",fe4:"EN / 中文",fe5:"All platforms",fe6:"Auto-update",fe7:"No bundles",fe8:"Live support",vh:"📋 Changelog",vhv:"Version",vhd:"Date",vhc:"Changes",vc1:"New UI, fast lane launched",vc2:"Fixed download speed",vc3:"Added English UI",vc4:"First stable release",faq:"❓ FAQ",q1:"How do I get a download key?",a1:"Open the Telegram bot and press Start.",q2:"Is the download free?",a2:"Completely free, no hidden fees.",q3:"Which systems are supported?",a3:"Windows, Mac, Android and iOS."}
+en:{home:"Home",fav:"Bookmark",app:"Mobile",new:"● New version!",reg:"Register",slogan:"Official · Ultra-fast · Safe",sbtn:"Search",sph:"Search software, games, files…",hotw:"Trending: ",n1:"Home",n2:"Software",n3:"Games",n4:"Mobile",n5:"Top charts",n6:"Topics",n7:"News",n8:"Forum",mq:"📢 Over 1,000,000 users on 根锚点下载! 🔥 New users get the fast lane 🔥 Verified · No adware · One-click download 🎉 38,542 downloads today 🎉",cat:"Categories",c1:"System tools",c2:"Games",c3:"Media players",c4:"Messaging",c5:"Security",c6:"Graphics",c7:"Office & study",c8:"Network",ad1:"🎁 Register, get 7 days VIP 🎁",news:"Notices",nw1:"Server upgrade done",nw2:"Invite friends, earn points",nw3:"v2.0 released",nw4:"Beware of fake sites",okbar:"✅ Signed in, ready to download",h1:"🔥 根锚点 Latest Official Version, Free 🔥",sub:"No bundles · No viruses · No adware · Full speed",bd1:"✔ Verified",bd2:"✔ Virus-free",bd3:"✔ Portable",bd4:"✔ Free forever",dl:"DOWNLOAD",st1:"Today",st2:"Rating",st3:"Size",st4:"Version",rec:"🔥 Hot picks",m1:"Fast",m2:"VIP",m3:"Toolkit",m4:"Full",get:"Get",ad2:"⚡ High-speed lane · 10× faster ⚡",cm:"💬 Comments",cmn:"(2,381)",cm1:"Super fast download! 👍",cm2:"Signing up via Telegram took a minute.",cm3:"Been using it for years.",cm4:"Honest site, no bundled junk ❤",rank:"📊 Top downloads",r1:"根锚点 Official",r2:"根锚点 Fast",r3:"根锚点 Portable",r4:"Resource pack 2026",r5:"Tool collection",r6:"Plugin pack",r7:"Theme pack",ad3:"💰 Invite friends, win prizes 💰",info:"ℹ️ Info",i1:"Language: Chinese / English",i2:"License: Free",i3:"OS: Windows (Android soon)",i4:"Updated: 2026-10-13",i5:"Rating: ★★★★★",f1:"About",f2:"Contact",f3:"Disclaimer",f4:"Sitemap",f5:"© 2026 根锚点下载",kf:"Support",dl2:"Download",totop:"↑Top",regT:"⚠ Please register / sign in",regW:"Registration is required to download. Takes 1 minute!",s1:"Open our Telegram bot",s2:"Press Start",s3:"The bot sends you a personal key",s4:"Paste the key below",openBot:"✈ Open Telegram bot",kph:"Paste your key",signIn:"Register / Sign in",err:"Invalid or expired key. Get a fresh key from the bot.",dlT:"📦 Get the archive",howTo:"Open our Telegram bot and send /download. The bot replies with an article — read it, then tap Agree to receive the ZIP, or Decline to cancel.",copyOpen:"Open bot & copy /download",close:"Close",signOut:"Sign out",hello:"Hi, user ",ad4:"🛡️ Full HTTPS encryption · Safer downloads 🛡️",feat:"✨ Features",fe1:"Fast download",fe2:"Virus-free",fe3:"Free forever",fe4:"EN / 中文",fe5:"All platforms",fe6:"Auto-update",fe7:"No bundles",fe8:"Live support",vh:"📋 Changelog",vhv:"Version",vhd:"Date",vhc:"Changes",vc1:"New UI, fast lane launched",vc2:"Fixed download speed",vc3:"Added English UI",vc4:"First stable release",faq:"❓ FAQ",q1:"How do I get a download key?",a1:"Open the Telegram bot and press Start.",q2:"Is the download free?",a2:"Completely free, no hidden fees.",q3:"Which systems are supported?",a3:"Windows now; Android coming soon.",pwin:"Windows",pwok:"Available · Download now",pand:"Android",psoon:"Not available yet · Coming soon"}
 };
 var ZH = {}; var lang = "zh", errOn = false, user = null;
 function $(id){return document.getElementById(id);}
@@ -251,7 +260,7 @@ function open(id){$(id).className="modal show";}
 function closeAll(){document.querySelectorAll(".modal").forEach(function(m){m.className="modal";});}
 function wantDownload(){ if(user) open("mDl"); else { $("regWarn").style.display=""; open("mReg"); } }
 function wantRegister(){ $("regWarn").style.display="none"; open("mReg"); }
-$("bigDl").onclick=wantDownload; $("dlFloat").onclick=wantDownload;
+$("bigDl").onclick=wantDownload; $("dlFloat").onclick=wantDownload; $("dlWin").onclick=wantDownload;
 document.querySelectorAll(".needreg").forEach(function(b){b.onclick=wantDownload;});
 $("regTop").onclick=wantRegister; $("regFloat").onclick=wantRegister;
 document.querySelectorAll("[data-close]").forEach(function(b){b.onclick=closeAll;});
