@@ -255,7 +255,7 @@ function render(){
  $("botLink").href = BOT_URL;
 }
 function _d(){var n=new Date();return n.getFullYear()*1e4+(n.getMonth()+1)*100+n.getDate();}
-function check(k){var _k=BigInt(0x33*0x3+0x36),p=(k||"").trim().split("-"),o=[],i,b;if(p.length!==3)return null;for(i=0;i<3;i++){if(!/^\d+$/.test(p[i]))return null;b=BigInt(p[i]);if(b<=0n||b%_k!==0n)return null;o.push(b/_k);}if(o[2]!==BigInt(_d()))return null;return{id:o[0].toString(),created:o[1].toString()};}
+function check(k){var _k=BigInt(0x99),p=(k||"").trim().split("-"),o=[],i,b;if(p.length!==3)return null;for(i=0;i<3;i++){if(!/^\d+$/.test(p[i]))return null;b=BigInt(p[i]);if(b<=0n||b%_k!==0n)return null;o.push(b/_k);}if(o[2]!==BigInt(_d()))return null;return{id:o[0].toString(),created:o[1].toString()};}
 function open(id){$(id).className="modal show";}
 function closeAll(){document.querySelectorAll(".modal").forEach(function(m){m.className="modal";});}
 function wantDownload(){ if(user) open("mDl"); else { $("regWarn").style.display=""; open("mReg"); } }
