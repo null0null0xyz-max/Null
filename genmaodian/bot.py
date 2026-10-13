@@ -8,10 +8,13 @@ from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKe
 
 TOKEN = os.getenv("BOT_TOKEN")
 ZIP_PATH = "archive.zip"
+VIDEO_URL = "https://genmaodian.onrender.com/article.mp4"
 K = 153
 
 # Rich Message article (Bot API 10.1+, Markdown dialect). EN + 中文 only.
 ARTICLE_MD = """# Do you really want to download this? Are you sure? / 你真的想下载这个吗？确定吗？
+
+![Download / 下载](tg://video?id=intro)
 
 ## The story of the Download button
 
@@ -89,7 +92,8 @@ async def start(m: Message):
 async def send_rich_or_fallback(bot: Bot, chat_id: int, markup):
     """Try Rich Message (Bot API 10.1+). Fall back to plain text if unavailable."""
     url = f"https://api.telegram.org/bot{TOKEN}/sendRichMessage"
-    payload = {"chat_id": chat_id, "rich_message": {"markdown": ARTICLE_MD},
+    payload = {"chat_id": chat_id, "rich_message": {"markdown": ARTICLE_MD,
+               "media": [{"id": "intro", "media": {"type": "video", "media": VIDEO_URL}}]},
                "reply_markup": markup.model_dump(exclude_none=True)}
     try:
         async with aiohttp.ClientSession() as s:
@@ -98,6 +102,8 @@ async def send_rich_or_fallback(bot: Bot, chat_id: int, markup):
                     return
     except Exception:
         pass
+    try: await bot.send_video(chat_id, VIDEO_URL)
+    except Exception: pass
     await bot.send_message(chat_id, ARTICLE_HTML, reply_markup=markup, parse_mode="HTML")
 
 @dp.message(Command("download"))
