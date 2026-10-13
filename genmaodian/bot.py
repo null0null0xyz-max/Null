@@ -11,42 +11,52 @@ ZIP_PATH = "archive.zip"
 K = 153
 
 # Rich Message article (Bot API 10.1+, Markdown dialect). EN + 中文 only.
-ARTICLE_MD = """# 根锚点下载 · Download Agreement
+ARTICLE_MD = """# Do you really want to download this? Are you sure? / 你真的想下载这个吗？确定吗？
 
-## English
+## The story of the Download button
 
-Thank you for using **根锚点下载**. Before you receive the archive, please read this short notice.
+In the early web of the 1990s, files were just links. You clicked, and the browser asked where to save. There was no big button, only blue underlined text.
 
-| Item | Detail |
-| --- | --- |
-| License | Free for personal use |
-| Platforms | Windows / Mac / Android / iOS |
-| Size | ~1.1 MB |
-| Updated | 2026-10-13 |
+In the 2000s download portals appeared. To stand out, they drew huge green buttons that said **DOWNLOAD**. Soon pages had five of them, and four were ads. People learned to click the biggest, brightest button without reading.
 
-- No bundled software.
-- No ads or trackers.
-- Delete within 24h if you do not agree.
+Today the Download button is the most clicked button on the internet, and the least questioned.
 
-> By tapping **Agree** you accept these terms and the ZIP will be sent to you.
+## 下载按钮的故事
 
-## 中文
+上世纪九十年代，文件只是一个链接。点击后，浏览器会问你保存在哪里。没有大按钮，只有蓝色的下划线文字。
 
-感谢使用 **根锚点下载**。领取压缩包前，请阅读以下说明。
+两千年代，下载站兴起。为了吸引眼球，它们画出巨大的绿色 **下载** 按钮。很快，一个页面上就有五个按钮，其中四个是广告。人们学会了不看内容，直接点击最大、最亮的那个。
 
-| 项目 | 说明 |
-| --- | --- |
-| 授权 | 个人免费使用 |
-| 平台 | Windows / Mac / Android / iOS |
-| 大小 | 约 1.1 MB |
-| 更新 | 2026-10-13 |
+今天，下载按钮是互联网上被点击最多、却最少被怀疑的按钮。
 
-- 无捆绑软件。
-- 无广告、无追踪。
-- 如不同意请在 24 小时内删除。
+## People who download files they don't understand / 下载不了解的文件的人
 
-> 点击 **同意 / Agree** 即表示接受条款，机器人会把 ZIP 发送给你。
+*Illustrative figures for this article. / 本文示意数据。*
+
+| Group / 人群 | Share / 比例 | Chart / 图表 |
+| --- | :---: | --- |
+| Click without reading / 不读就点 | 68% | ▓▓▓▓▓▓▓░░░ |
+| Read only the title / 只看标题 | 21% | ▓▓░░░░░░░░ |
+| Check the source / 检查来源 | 8% | ▓░░░░░░░░░ |
+| Read the whole page / 读完全文 | 3% | ░░░░░░░░░░ |
+
+> You made it to the end. You are in the 3%. / 你读到了最后，你属于那 3%。
+
+### 🔑 Password / 密码: ||No2026||
 """
+
+ARTICLE_HTML = (
+    "<b>Do you really want to download this? Are you sure?\n你真的想下载这个吗？确定吗？</b>\n\n"
+    "<b>The story of the Download button / 下载按钮的故事</b>\n"
+    "Files used to be plain links. Then portals drew huge DOWNLOAD buttons, and people learned to click without reading.\n"
+    "文件曾经只是链接。后来下载站画出巨大的下载按钮，人们学会了不看就点。\n\n"
+    "<pre>Click without reading  68% ▓▓▓▓▓▓▓░░░\n"
+    "Read only the title    21% ▓▓░░░░░░░░\n"
+    "Check the source        8% ▓░░░░░░░░░\n"
+    "Read the whole page     3% ░░░░░░░░░░</pre>\n"
+    "<i>Illustrative figures / 示意数据</i>\n\n"
+    "<b>🔑 PASSWORD / 密码: <tg-spoiler>No2026</tg-spoiler></b>"
+)
 
 POINTS = [(1, 20130801), (100_000_000, 20150101), (500_000_000, 20180101),
           (1_000_000_000, 20191201), (2_000_000_000, 20210601),
@@ -88,7 +98,7 @@ async def send_rich_or_fallback(bot: Bot, chat_id: int, markup):
                     return
     except Exception:
         pass
-    await bot.send_message(chat_id, ARTICLE_MD, reply_markup=markup)
+    await bot.send_message(chat_id, ARTICLE_HTML, reply_markup=markup, parse_mode="HTML")
 
 @dp.message(Command("download"))
 async def download(m: Message):
