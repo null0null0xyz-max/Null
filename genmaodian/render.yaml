@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: genmaodian-site
+    runtime: static
+    staticPublishPath: ./public
+    buildCommand: ""
+  - type: worker
+    name: genmaodian-bot
+    runtime: python
+    buildCommand: pip install aiogram==3.*
+    startCommand: python bot.py
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
