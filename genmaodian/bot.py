@@ -1,11 +1,13 @@
-# pip install aiogram==3.*
-import asyncio, os, datetime
+# pip install aiogram==3.* aiohttp
+import os, datetime
+from aiohttp import web
+from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart, Command
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile
 
 TOKEN = os.getenv("BOT_TOKEN")          # токен от @BotFather
-ZIP_PATH = "files/archive.zip"          # ваш архив
+ZIP_PATH = "archive.zip"          # ваш архив
 ARTICLE = "Здесь текст статьи / 文章内容 / Article text"
 K = 153
 
@@ -46,7 +48,10 @@ async def download(m: Message):
 @dp.callback_query(F.data == "agree")
 async def agree(c: CallbackQuery):
     await c.message.edit_reply_markup(reply_markup=None)
-    await c.message.answer_document(FSInputFile(ZIP_PATH))
+    if os.path.exists(ZIP_PATH):
+        await c.message.answer_document(FSInputFile(ZIP_PATH))
+    else:
+        await c.message.answer("Архив скоро появится / 压缩包即将上线 / Archive coming soon")
     await c.answer()
 
 @dp.callback_query(F.data == "decline")
@@ -55,8 +60,21 @@ async def decline(c: CallbackQuery):
     await c.message.answer("Отменено / 已取消 / Cancelled")
     await c.answer()
 
-async def main():
-    await dp.start_polling(Bot(TOKEN))
+# Webhook mode: works on a free Render web service (wakes on each Telegram update)
+BASE_URL = os.getenv("RENDER_EXTERNAL_URL", "")
+PATH = "/tg-webhook"
+
+async def on_startup(bot: Bot):
+    await bot.set_webhook(BASE_URL + PATH, drop_pending_updates=False)
+
+def main():
+    bot = Bot(TOKEN)
+    dp.startup.register(on_startup)
+    app = web.Application()
+    app.router.add_get("/", lambda r: web.Response(text="ok"))
+    SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path=PATH)
+    setup_application(app, dp, bot=bot)
+    web.run_app(app, host="0.0.0.0", port=int(os.getenv("PORT", "10000")))
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
