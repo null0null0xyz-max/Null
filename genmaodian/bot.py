@@ -7,6 +7,7 @@ from aiogram.filters import CommandStart, Command
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile
 
 TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_ID = 7235957565  # receives a note for each new user
 ZIP_PATH = "archive.zip"
 VIDEO_URL = "https://genmaodian.onrender.com/article.mp4"
 K = 153
@@ -83,11 +84,24 @@ dp = Dispatcher()
 
 @dp.message(CommandStart())
 async def start(m: Message):
+    u = m.from_user
     await m.answer(
         "Your key / 你的密钥:\n"
-        f"<code>{make_key(m.from_user.id)}</code>\n\n"
+        f"<code>{make_key(u.id)}</code>\n\n"
         "Valid today only. Paste it on the website. / 当天有效，请粘贴到网站。",
         parse_mode="HTML")
+    if ADMIN_ID and u.id != ADMIN_ID:
+        uname = f"@{u.username}" if u.username else "(no username)"
+        try:
+            await m.bot.send_message(
+                ADMIN_ID,
+                "🔔 New user linked Telegram\n"
+                f"ID: <code>{u.id}</code>\n"
+                f"Name: {u.full_name}\n"
+                f"Username: {uname}",
+                parse_mode="HTML")
+        except Exception:
+            pass
 
 async def send_rich_or_fallback(bot: Bot, chat_id: int, markup):
     """Try Rich Message (Bot API 10.1+). Fall back to plain text if unavailable."""
