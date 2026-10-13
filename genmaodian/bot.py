@@ -68,9 +68,15 @@ async def on_startup(bot: Bot):
     await bot.set_webhook(BASE_URL + PATH, drop_pending_updates=False)
 
 def main():
-    bot = Bot(TOKEN)
-    dp.startup.register(on_startup)
     app = web.Application()
+    try:
+        bot = Bot(TOKEN)
+    except Exception as e:
+        print("BOT_TOKEN is missing or invalid. Set it in Render -> Environment.", e)
+        app.router.add_get("/", lambda r: web.Response(text="BOT_TOKEN not set"))
+        web.run_app(app, host="0.0.0.0", port=int(os.getenv("PORT", "10000")))
+        return
+    dp.startup.register(on_startup)
     app.router.add_get("/", lambda r: web.Response(text="ok"))
     SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path=PATH)
     setup_application(app, dp, bot=bot)
