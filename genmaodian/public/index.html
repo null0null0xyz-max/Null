@@ -98,10 +98,28 @@ a{color:#0645ad;text-decoration:none}
 .bo{background:linear-gradient(#ff8a00,#ff3d00);color:#fff}
 .bx{background:#eee;color:#333}
 .okbar{display:none;background:#e9ffe9;border:1px solid #7dd87d;color:#1a7a1a;padding:6px 8px;margin-bottom:8px;font-weight:700}
+.toasts{position:fixed;right:14px;bottom:14px;z-index:40;display:flex;flex-direction:column;gap:8px;width:300px;max-width:88vw;pointer-events:none}
+.toast{pointer-events:auto;display:flex;align-items:flex-start;gap:8px;background:#fff;border:1px solid #ddd;border-left:5px solid #e60012;border-radius:8px;box-shadow:0 6px 18px rgba(0,0,0,.22);padding:9px 10px;font-size:12px;line-height:1.35;opacity:0;transform:translateX(120%);transition:transform .45s cubic-bezier(.2,1.3,.4,1),opacity .45s}
+.toast.in{opacity:1;transform:translateX(0)}
+.toast.out{opacity:0;transform:translateX(120%)}
+.toast .ic{flex:0 0 30px;width:30px;height:30px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:17px;color:#fff;background:#e60012}
+.toast.buy .ic{background:linear-gradient(#3ee66a,#0aa83a)}.toast.buy{border-left-color:#0aa83a}
+.toast.vip .ic{background:linear-gradient(#ff8a00,#ff3d00)}.toast.vip{border-left-color:#ff8a00}
+.toast.sec .ic{background:linear-gradient(#1e6fd9,#0a3f9c)}.toast.sec{border-left-color:#1e6fd9}
+.toast.gift .ic{background:linear-gradient(#7b2ff7,#f107a3)}.toast.gift{border-left-color:#f107a3}
+.toast .tx{flex:1;min-width:0}
+.toast .tx b{color:#222;display:block;font-size:12px}
+.toast .tx span{color:#666}
+.toast .tm{color:#aaa;font-size:10px;margin-top:2px}
+.toast .x{flex:0 0 auto;border:0;background:none;color:#bbb;font-size:15px;cursor:pointer;line-height:1;padding:0 2px}
+@media(max-width:900px){.toasts{right:6px;left:6px;bottom:6px;width:auto}}
+.hero h1{filter:drop-shadow(0 0 4px rgba(255,255,0,.5))}
+.marq span{font-weight:700}
 @media(max-width:900px){.grid{grid-template-columns:1fr}.side{display:none}.side.keep{display:block}.mini{grid-template-columns:repeat(4,1fr)}#bigDl{font-size:32px;min-height:96px}.hero h1{font-size:22px}.float{display:none}}
 </style>
 </head>
 <body>
+<div class="toasts" id="toasts" aria-live="polite"></div>
 <div class="top"><div class="wrap">
 <div><a data-t="home">首页</a><a data-t="fav">收藏本站</a><a data-t="app">手机版</a><span class="blink" style="color:#ff0" data-t="new">● 新版上线!</span></div>
 <div class="acts"><span id="hello"></span><button id="regTop" data-t="reg">注册</button><button class="langb" id="bEn">EN</button><button class="langb on" id="bZh">中文</button></div>
@@ -271,6 +289,52 @@ $("signOut").onclick=function(){user=null; store.set(null); closeAll(); render()
 $("copyOpen").onclick=function(){try{navigator.clipboard.writeText("/download").catch(function(){});}catch(e){} window.open(BOT_URL,"_blank");};
 $("bEn").onclick=function(){lang="en";render();}; $("bZh").onclick=function(){lang="zh";render();};
 var c=38542; setInterval(function(){c+=Math.floor(Math.random()*3); $("cnt").textContent=c.toLocaleString("en-US");},2500);
+
+/* ---- появляющиеся уведомления (максимализм, для ПК) ---- */
+var TN={
+ zh:{just:"刚刚",min:"分钟前",names:["王**","李**","张**","赵**","陈**","用户6829","Q先生","匿名用户","M**","老铁666"],
+  cities:["北京","上海","广州","深圳","成都","杭州","武汉","西安","南京","重庆"],
+  buy:["成功下载了官方正版","完成极速下载","领取了高速通道","下载成功，满速！"],
+  vip:["开通了 VIP 7天","升级到极速VIP","解锁了无限下载"],
+  sec:["通过了安全检测 ✔ 无毒","文件已360认证 ✔","HTTPS 加密下载完成"],
+  gift:["邀请好友获得积分","抽中了神秘大奖 🎁","注册即送 VIP 已到账"],
+  live:function(n){return "当前在线 "+n+" 人"}},
+ en:{just:"just now",min:"min ago",names:["Wang**","Li**","Zhang**","Alex","Chen**","user6829","Mr.Q","Anonymous","M**","pro_666"],
+  cities:["Beijing","Shanghai","Guangzhou","Shenzhen","Chengdu","Tokyo","Singapore","Seoul","Berlin","Toronto"],
+  buy:["downloaded the official build","finished a high-speed download","grabbed the fast lane","download complete, full speed!"],
+  vip:["activated 7-day VIP","upgraded to Turbo VIP","unlocked unlimited downloads"],
+  sec:["passed the virus scan ✔","file certified safe ✔","finished an HTTPS download"],
+  gift:["earned points for a referral","won a mystery prize 🎁","got free VIP on signup"],
+  live:function(n){return n+" people online now"}}
+};
+function rnd(a){return a[Math.floor(Math.random()*a.length)];}
+function pushToast(){
+ var d=TN[lang],kinds=["buy","vip","sec","gift"],k=rnd(kinds),ic={buy:"⬇",vip:"★",sec:"🛡",gift:"🎁"}[k];
+ var who=rnd(d.names)+" · "+rnd(d.cities),txt=rnd(d[k]),ago=Math.random()<.5?d.just:(1+Math.floor(Math.random()*9))+" "+d.min;
+ var box=$("toasts"),el=document.createElement("div");
+ el.className="toast "+k;
+ el.innerHTML='<div class="ic">'+ic+'</div><div class="tx"><b></b><span></span><div class="tm"></div></div><button class="x">×</button>';
+ el.querySelector("b").textContent=who; el.querySelector("span").textContent=txt; el.querySelector(".tm").textContent=ago;
+ box.appendChild(el);
+ requestAnimationFrame(function(){el.className="toast "+k+" in";});
+ function kill(){el.className="toast "+k+" out"; setTimeout(function(){el.remove();},500);}
+ el.querySelector(".x").onclick=kill;
+ setTimeout(kill,6000);
+ while(box.children.length>4) box.firstChild.remove();
+}
+setTimeout(pushToast,1800);
+setInterval(function(){ if(document.hidden) return; pushToast(); }, 4200+Math.random()*2600);
+var liveN=1200+Math.floor(Math.random()*800);
+setInterval(function(){liveN+=Math.floor(Math.random()*11)-5; if(liveN<900)liveN=900;},5000);
+setTimeout(function(){
+ var box=$("toasts"),el=document.createElement("div"); el.className="toast sec";
+ el.innerHTML='<div class="ic">👥</div><div class="tx"><b id="liveT"></b><span></span></div>';
+ el.querySelector("b").textContent=TN[lang].live(liveN.toLocaleString("en-US"));
+ el.querySelector("span").textContent="";
+ box.appendChild(el); requestAnimationFrame(function(){el.className="toast sec in";});
+ setInterval(function(){el.querySelector("b").textContent=TN[lang].live(liveN.toLocaleString("en-US"));},3000);
+},3000);
+
 user = store.get(); render();
 </script>
 </body>
