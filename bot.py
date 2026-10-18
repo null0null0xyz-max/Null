@@ -720,12 +720,18 @@ def status_text(chat):
     except Exception:
         pass
     s = C(chat)["session"]
+    try:
+        r = resources()
+        mem = (f"CPU {r['cpu']:.0f}% · " if r["cpu"] is not None else "") + \
+            (f"RAM {r['mem']:.0f}% ({r['mem_mb']}/{r['mem_max']} МБ)" if r["mem"] is not None else mem)
+    except Exception:
+        pass
     return (f"🤖 Claude Code: <code>{html.escape(ver or '?')}</code>\n"
             f"Провайдер: <code>{html.escape(cfg['provider'])}</code> · модель <code>{html.escape(cfg['model'])}</code>\n"
             f"Effort: {cfg.get('effort') or 'авто'} · режим: {MODES.get(cfg['mode'])}\n"
             f"Сессия: <code>{s[:8] if s else 'новая'}</code> · задача: {'идёт' if runs else 'нет'}\n"
             f"ECC: {len(ecc_cmds)} команд, навыки {'вкл' if cfg.get('ecc_skills') else 'выкл'}\n"
-            f"Диск: свободно {du.free // 2**20} МБ из {du.total // 2**20} МБ" + (f"\nПамять: {mem}" if mem else ""))
+            f"Диск: свободно {du.free // 2**20} МБ из {du.total // 2**20} МБ" + (f"\nНагрузка: {mem}" if mem else ""))
 
 
 def usage_text():
@@ -1146,6 +1152,114 @@ def ensure_claude():
         CLAUDE = local
 
 
+# ---------------- монитор ресурсов: CPU / RAM / диск > 80% -> сообщение владельцу ----------------
+ALERT_PCT = float(os.environ.get("ALERT_PCT", 80))
+
+
+def _read(p):
+    try:
+        return open(p).read().strip()
+    except OSError:
+        return ""
+
+
+def mem_pct():
+    cur = _read("/sys/fs/cgroup/memory.current") or _read("/sys/fs/cgroup/memory/memory.usage_in_bytes")
+    mx = _read("/sys/fs/cgroup/memory.max") or _read("/sys/fs/cgroup/memory/memory.limit_in_bytes")
+    if not cur or not mx or mx == "max" or int(mx) > 1 << 50:
+        return None, 0, 0
+    return int(cur) * 100 / int(mx), int(cur) >> 20, int(mx) >> 20
+
+
+def cpu_usage_usec():
+    for line in _read("/sys/fs/cgroup/cpu.stat").splitlines():
+        if line.startswith("usage_usec"):
+            return int(line.split()[1])
+    v = _read("/sys/fs/cgroup/cpuacct/cpuacct.usage")
+    return int(v) // 1000 if v else None
+
+
+def cpu_limit():
+    q = _read("/sys/fs/cgroup/cpu.max").split()
+    if len(q) == 2 and q[0] != "max":
+        return int(q[0]) / int(q[1])
+    q, p = _read("/sys/fs/cgroup/cpu/cpu.cfs_quota_us"), _read("/sys/fs/cgroup/cpu/cpu.cfs_period_us")
+    if q and p and int(q) > 0:
+        return int(q) / int(p)
+    return float(os.cpu_count() or 1)
+
+
+def top_procs():
+    try:
+        out = subprocess.run(["ps", "-eo", "rss,pcpu,comm", "--sort=-rss"], capture_output=True,
+                             text=True, timeout=10).stdout.splitlines()[1:6]
+        return "\n".join(f"{int(l.split()[0]) >> 10} МБ · {l.split()[1]}% · {l.split()[2]}" for l in out)
+    except Exception:
+        return ""
+
+
+def resources():
+    u1, t1 = cpu_usage_usec(), time.time()
+    time.sleep(5)
+    u2, t2 = cpu_usage_usec(), time.time()
+    cpu = (u2 - u1) / 1e6 / (t2 - t1) / cpu_limit() * 100 if u1 is not None and u2 is not None else None
+    mem, used, mx = mem_pct()
+    if mem is None and os.environ.get("SERVER_MEMORY"):  # Pterodactyl/Wispbyte отдаёт лимит в env
+        mx = int(os.environ["SERVER_MEMORY"])
+        used = int(subprocess.run(["sh", "-c", "ps -eo rss= | awk '{s+=$1} END {print s}'"],
+                                  capture_output=True, text=True).stdout.strip() or 0) >> 10
+        mem = used * 100 / mx if mx else None
+    dmb, dmax = disk_used()
+    return {"cpu": cpu, "mem": mem, "mem_mb": used, "mem_max": mx,
+            "disk": dmb * 100 / dmax, "disk_mb": dmb, "disk_max": dmax}
+
+
+_disk = {"t": 0, "v": 0}
+
+
+def disk_used():
+    """Занято в папке сервера (лимит Wispbyte — квота, df её не видит). Пересчёт раз в 5 мин."""
+    dmax = int(os.environ.get("DISK_LIMIT_MB") or os.environ.get("SERVER_DISK") or 1024) or 1024
+    if time.time() - _disk["t"] > 300:
+        total = 0
+        for root in {HERE, os.path.expanduser("~")}:
+            for d, _, files in os.walk(root):
+                for f in files:
+                    try:
+                        total += os.lstat(os.path.join(d, f)).st_size
+                    except OSError:
+                        pass
+        _disk.update(t=time.time(), v=total >> 20)
+    return _disk["v"], dmax
+
+
+def monitor():
+    last = {}
+    while True:
+        try:
+            r = resources()
+            hot = []
+            if r["cpu"] is not None and r["cpu"] >= ALERT_PCT:
+                hot.append(f"🔥 CPU: {r['cpu']:.0f}% от лимита")
+            if r["mem"] is not None and r["mem"] >= ALERT_PCT:
+                hot.append(f"🧠 RAM: {r['mem']:.0f}% ({r['mem_mb']} из {r['mem_max']} МБ)")
+            if r["disk"] >= ALERT_PCT:
+                hot.append(f"💾 Диск: {r['disk']:.0f}% ({r['disk_mb']} из {r['disk_max']} МБ)")
+            now = time.time()
+            fresh = [h for h in hot if now - last.get(h[:2], 0) > 1800]  # не чаще раза в 30 мин на ресурс
+            if fresh and OWNER:
+                for h in fresh:
+                    last[h[:2]] = now
+                tp = top_procs()
+                tg("sendMessage", chat_id=OWNER, parse_mode="HTML",
+                   text="⚠️ <b>Сервер нагружен</b>\n" + "\n".join(hot) +
+                   (f"\n\nБольше всего едят:\n<pre>{html.escape(tp)}</pre>" if tp else "") +
+                   ("\n\nИдёт задача — /stop, если надо остановить." if runs else ""))
+        except Exception as e:
+            print("monitor error:", e, flush=True)
+        time.sleep(25)
+
+
 BOT_ID, BOT_USERNAME = 0, ""
 
 
@@ -1168,6 +1282,7 @@ def main():
     user_cmds_changed()
     register_commands()
     threading.Thread(target=lambda: (install_ecc(), register_commands()), daemon=True).start()
+    threading.Thread(target=monitor, daemon=True).start()
     print("bot started", flush=True)
     offset = 0
     while True:
