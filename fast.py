@@ -15,6 +15,10 @@ TOOLS = [
     {"name": "web_fetch", "description": "Прочитать веб-страницу как текст. Для поиска в интернете: "
      "https://html.duckduckgo.com/html/?q=<запрос>",
      "input_schema": {"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"]}},
+    {"name": "chart", "description": "Построить график или диаграмму. config — конфиг Chart.js (как в QuickChart): "
+     "type (line, bar, pie, doughnut, radar, scatter…), data (labels, datasets), options. Картинка прикрепится к ответу.",
+     "input_schema": {"type": "object", "properties": {"config": {"type": "object"}, "caption": {"type": "string"}},
+                      "required": ["config"]}},
     {"name": "claude_code", "description": "Передать задачу полноценному Claude Code (запуск ~30–60 с): писать или менять "
      "код и файлы проекта, большие многошаговые задачи, агенты, сборки, анализ присланных файлов. "
      "Передай полную формулировку задачи с нужным контекстом из разговора. После вызова больше ничего не пиши.",
@@ -39,6 +43,14 @@ def save_hist(here, chat, h):
     json.dump(h[-HIST_N:], open(hist_path(here, chat), "w"), ensure_ascii=False)
 
 
+def add_note(here, chat, user, assistant):
+    """Добавить в историю быстрого режима событие (например, ответ агента), чтобы о нём можно было спросить."""
+    h = load_hist(here, chat)
+    if h and h[-1]["role"] == "user":
+        h.append({"role": "assistant", "content": "…"})
+    save_hist(here, chat, h + [{"role": "user", "content": user}, {"role": "assistant", "content": assistant}])
+
+
 def clear_hist(here, chat):
     try:
         os.remove(hist_path(here, chat))
@@ -50,6 +62,16 @@ def _html_text(s):
     s = re.sub(r"(?is)<(script|style|noscript).*?</\1>", " ", s)
     s = re.sub(r"(?s)<[^>]+>", " ", s)
     return re.sub(r"\s+", " ", html.unescape(s)).strip()
+
+
+def make_chart(inp):
+    r = requests.post("https://quickchart.io/chart/create", timeout=30,
+                      json={"chart": inp.get("config") or {}, "width": 900, "height": 520,
+                            "backgroundColor": "white", "version": "4"})
+    j = r.json()
+    if not j.get("success") or not j.get("url"):
+        raise RuntimeError(str(j)[:300])
+    return j["url"]
 
 
 def run_tool(name, inp, rexec_url, rexec_token):
@@ -71,7 +93,7 @@ def run_tool(name, inp, rexec_url, rexec_token):
     return "нет такого инструмента"
 
 
-def stream(base, token, model, system, messages, on_text, stopped, tools=TOOLS):
+def stream(base, token, model, system, messages, on_text, stopped, tools=TOOLS, on_think=None):
     """Один запрос /v1/messages со стримингом. Возвращает (content_blocks, stop_reason, usage)."""
     url = (base or "https://api.anthropic.com").rstrip("/") + "/v1/messages"
     hdr = {"content-type": "application/json", "anthropic-version": "2023-06-01"}
@@ -109,6 +131,8 @@ def stream(base, token, model, system, messages, on_text, stopped, tools=TOOLS):
                 if d.get("type") == "text_delta":
                     b["text"] = b.get("text", "") + d["text"]
                     on_text(d["text"])
+                elif d.get("type") == "thinking_delta" and on_think:
+                    on_think(d.get("thinking", ""))
                 elif d.get("type") == "input_json_delta":
                     b["_json"] += d.get("partial_json", "")
             elif t == "message_delta":
@@ -131,10 +155,11 @@ def answer(here, chat, prompt, base, token, model, system, rexec_url, rexec_toke
     Возвращает {"text", "delegate", "steps", "in", "out"}."""
     hist = load_hist(here, chat)
     msgs = hist + [{"role": "user", "content": prompt}]
-    res = {"text": "", "delegate": None, "steps": [], "in": 0, "out": 0}
-    tools = [t for t in TOOLS if t["name"] == "web_fetch"] if guest else TOOLS  # гостям — без сервера
+    res = {"text": "", "delegate": None, "steps": [], "in": 0, "out": 0, "images": []}
+    think = ui.get("think")
+    tools = [t for t in TOOLS if t["name"] in ("web_fetch", "chart")] if guest else TOOLS  # гостям — без сервера
     for _ in range(10):
-        blocks, stop, usage = stream(base, token, model, system, msgs, ui["text"], stopped, tools)
+        blocks, stop, usage = stream(base, token, model, system, msgs, ui["text"], stopped, tools, think)
         res["in"] += usage.get("input_tokens", 0)
         res["out"] += usage.get("output_tokens", 0)
         text = "".join(b.get("text", "") for b in blocks if b["type"] == "text")
@@ -143,7 +168,7 @@ def answer(here, chat, prompt, base, token, model, system, rexec_url, rexec_toke
             res["text"] = text
             break
         if not calls and not text.strip():  # некоторые модели с tools только «думают» — переспрашиваем без tools
-            blocks, stop, usage = stream(base, token, model, system, msgs, ui["text"], stopped, [])
+            blocks, stop, usage = stream(base, token, model, system, msgs, ui["text"], stopped, [], think)
             res["out"] += usage.get("output_tokens", 0)
             text = "".join(b.get("text", "") for b in blocks if b["type"] == "text")
         if not calls:
@@ -156,6 +181,17 @@ def answer(here, chat, prompt, base, token, model, system, rexec_url, rexec_toke
                 res["delegate"] = c["input"].get("task") or prompt
                 res["text"] = text
                 break
+            if c["name"] == "chart":
+                label = "📊 " + (c["input"].get("caption") or "график")[:80]
+                res["steps"].append(label)
+                ui["step"](label)
+                try:
+                    res["images"].append((make_chart(c["input"]), c["input"].get("caption", "")))
+                    out = "Готово, график будет приложен к ответу отдельной картинкой. Не вставляй ссылку на него."
+                except Exception as e:
+                    out = f"ошибка построения графика: {e}"
+                results.append({"type": "tool_result", "tool_use_id": c["id"], "content": out})
+                continue
             label = ("⚙️ " + c["input"].get("command", "")[:80]) if c["name"] == "bash" else \
                 ("🌐 " + c["input"].get("url", "")[:80])
             res["steps"].append(label)
