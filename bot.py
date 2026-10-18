@@ -1095,7 +1095,7 @@ def start_task(chat, prompt, guest=False, who="владелец", mid=None):
     if not CHANNEL:
         return tg("sendMessage", chat_id=chat, text="Сначала добавь меня админом в канал для файлов.")
     if any(not r["stopped"] for r in runs.values()):  # остановленные уже не мешают
-        return tg("sendMessage", chat_id=chat, text="Ещё работаю над прошлой задачей — подожди или напиши «стоп».",
+        return tg("sendMessage", chat_id=chat, text="Ещё работаю над прошлой задачей — подожди или /stop.",
                   **({"reply_parameters": {"message_id": mid, "allow_sending_without_reply": True}} if mid else {}))
     target = run_fast if fast_ok(prompt) else run_claude
     threading.Thread(target=target, args=(chat, prompt, guest, who, mid), daemon=True).start()
@@ -1393,8 +1393,6 @@ def on_message(msg, channel=False):
         return collect_media(msg, media)
     if not text:
         return
-    if not guest and re.fullmatch(r"(?i)\s*(стоп|stop|хватит|отмена|остановись|останови|cancel)[.!]*\s*", text):
-        text = "/stop"
     if text.startswith("/"):
         if guest and not text.startswith(("/help", "/start")):
             return
