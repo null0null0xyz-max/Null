@@ -30,26 +30,31 @@ CLAUDE_DIR = os.path.expanduser("~/.claude")
 ECC_URL = "https://codeload.github.com/affaan-m/ECC/tar.gz/refs/heads/main"
 ECC_PARTS = ("commands/", "agents/", "skills/", "rules/common/")
 # команды Claude Code, которые бот передаёт в Claude как есть (работают в -p)
-PASS = {"compact": "/compact", "context": "/context", "cost": "/cost", "init": "/init",
+PASS = {"compact": "/compact", "context": "/context", "init": "/init",
         "review": "/review", "security_review": "/security-review"}
 BUILTIN = [("menu", "Модель, провайдеры, effort, режим"), ("new", "Новая сессия (= /clear)"),
            ("clear", "Новая сессия"), ("resume", "Вернуться к прошлой сессии"),
            ("effort", "Effort: low/medium/high/xhigh/max"), ("model", "Сменить модель"),
            ("mode", "Режим разрешений (план / всё)"), ("plan", "Включить/выключить режим плана"),
            ("compact", "Сжать контекст сессии"), ("context", "Сколько занято контекста"),
-           ("cost", "Стоимость сессии"), ("init", "Создать CLAUDE.md для проекта"),
+           ("init", "Создать CLAUDE.md для проекта"),
            ("review", "Ревью кода"), ("security_review", "Проверка безопасности"),
            ("stop", "Остановить задачу"), ("status", "Состояние бота и сервера"),
-           ("files", "Файлы проекта"), ("ecc", "Команды Everything Claude Code"),
+           ("files", "Файлы проекта"), ("usage", "Кредиты, токены, остаток"),
+           ("agents", "Чаты агентов последней задачи"), ("skills", "Навыки"),
+           ("repair", "Восстановить оглавление и index в канале"),
+           ("ecc", "Команды Everything Claude Code"),
            ("help", "Справка")]
 SYSTEM_HINT = (
     "Рабочая папка проекта — текущая директория. Файлы читай и правь здесь. "
     "Любые тяжёлые команды (установка пакетов, запуск, тесты, сборка) выполняй через "
     'Bash: rexec "команда" — она выполнится на удалённой машине с копией папки, '
-    "изменённые файлы вернутся сюда. Отвечай по-русски."
+    "изменённые файлы вернутся сюда. Отвечай по-русски. "
+    "Навыки лежат в ~/.claude/skills. Если пользователь просит или задача повторяется — можешь сам создать "
+    "новый навык: ~/.claude/skills/<имя>/SKILL.md (frontmatter name и description, дальше инструкция)."
 )
 TOOL_ICONS = {"Bash": "⚙️", "Read": "📖", "Write": "✏️", "Edit": "✏️", "MultiEdit": "✏️",
-              "Grep": "🔎", "Glob": "🔎", "WebFetch": "🌐", "WebSearch": "🌐", "Task": "🧩", "TodoWrite": "📝"}
+              "Grep": "🔎", "Glob": "🔎", "WebFetch": "🌐", "WebSearch": "🌐", "Task": "🧩", "Agent": "🧩", "Skill": "🧠", "TodoWrite": "📝"}
 
 cfg = json.load(open(CFG_PATH)) if os.path.exists(CFG_PATH) else {}
 for _k, _v in json.loads(json.dumps(DEFAULT_CFG)).items():
@@ -104,7 +109,8 @@ def chunks(text, n=3500):
 
 
 def step_label(name, inp):
-    arg = inp.get("command") or inp.get("file_path") or inp.get("pattern") or inp.get("url") or ""
+    arg = inp.get("command") or inp.get("file_path") or inp.get("pattern") or inp.get("url") \
+        or inp.get("description") or inp.get("skill") or ""
     arg = os.path.relpath(arg, WS) if arg.startswith(WS) else arg
     arg = (arg[:48] + "…") if len(arg) > 48 else arg
     return f"{TOOL_ICONS.get(name, '🔧')} {name} {arg}".strip()
@@ -129,12 +135,46 @@ def claude_env():
     return env
 
 
+QUOTA_PER_USD = 500000  # new-api / one-api: 500 000 единиц квоты = $1
+last_agents = {}        # агенты последней задачи — для /agents
+
+
+def provider_balance():
+    """Остаток у провайдера (new-api/one-api совместимые: /api/usage/token/). None, если не умеет."""
+    p = cfg["providers"][cfg["provider"]]
+    if not p.get("base_url") or not p.get("token"):
+        return None
+    try:
+        j = requests.get(p["base_url"] + "/api/usage/token/", timeout=10,
+                         headers={"Authorization": "Bearer " + p["token"]}).json()
+        d = j.get("data") or {}
+        if "total_available" in d:
+            return {"left": d["total_available"] / QUOTA_PER_USD, "used": d.get("total_used", 0) / QUOTA_PER_USD,
+                    "unlimited": d.get("unlimited_quota", False)}
+    except Exception:
+        pass
+    return None
+
+
+def fmt_k(n):
+    return f"{n / 1000:.1f}k" if n >= 1000 else str(n)
+
+
+def bq(title, body, limit=3300):
+    """Сворачиваемая цитата: в чате видно 3 строки, по нажатию раскрывается."""
+    body = body if len(body) <= limit else "…" + body[-limit:]
+    return f"<blockquote expandable>{title}\n{html.escape(body)}</blockquote>"
+
+
 def run_claude(chat_id, prompt):
     did = next(draft_ids)
     started = time.time()
-    st = {"steps": [], "text": "", "thinking": "", "result": "", "error": "", "dirty": True}
+    st = {"steps": [], "text": "", "thinking": "", "result": "", "error": "", "dirty": True, "res": {}}
+    agents = {}  # tool_use_id агента -> {"name", "log": [], "last": ""}
+    bal0 = provider_balance()
     cmd = [CLAUDE, "-p", prompt, "--output-format", "stream-json", "--verbose",
-           "--include-partial-messages", "--model", cfg["model"], "--append-system-prompt", SYSTEM_HINT]
+           "--include-partial-messages", "--forward-subagent-text",
+           "--model", cfg["model"], "--append-system-prompt", SYSTEM_HINT]
     mode = cfg.get("mode", "bypass")
     cmd += ["--dangerously-skip-permissions"] if mode == "bypass" else ["--permission-mode", mode]
     if cfg.get("effort"):
@@ -152,8 +192,10 @@ def run_claude(chat_id, prompt):
 
     def draft_html():
         sec = int(time.time() - started)
-        steps = "\n".join(html.escape(s) for s in st["steps"][-5:])
-        status = f"Думаю · {sec} с" + (f"\n{steps}" if steps else "")
+        steps = "\n".join(html.escape(x) for x in st["steps"][-5:])
+        status = f"Думаю · {sec} с · шагов {len(st['steps'])}" + (f"\n{steps}" if steps else "")
+        for a in list(agents.values())[-3:]:
+            status += f"\n🧩 {html.escape(a['name'])}: {html.escape(a['last'][:70] or 'работает…')}"
         if st["thinking"] and not st["text"]:
             status += "\n" + html.escape(st["thinking"][-300:])
         body = md_to_html(st["text"][-3000:]) if st["text"] else ""
@@ -179,8 +221,8 @@ def run_claude(chat_id, prompt):
         except ValueError:
             errlines.append(line)
             continue
-        t = ev.get("type")
-        if t == "stream_event":
+        t, pid = ev.get("type"), ev.get("parent_tool_use_id")
+        if t == "stream_event" and not pid:
             e = ev.get("event", {})
             if e.get("type") == "content_block_delta":
                 d = e.get("delta", {})
@@ -190,14 +232,34 @@ def run_claude(chat_id, prompt):
                 elif d.get("type") == "thinking_delta":
                     st["thinking"] += d.get("thinking", "")
                     st["dirty"] = True
+        elif t == "assistant" and pid:  # сообщение субагента
+            a = agents.setdefault(pid, {"name": "агент", "log": [], "last": ""})
+            for c in ev.get("message", {}).get("content", []):
+                if c.get("type") == "text" and c.get("text", "").strip():
+                    a["log"].append(c["text"].strip())
+                    a["last"] = c["text"].strip().splitlines()[0]
+                elif c.get("type") == "thinking" and c.get("thinking"):
+                    a["log"].append("💭 " + c["thinking"].strip()[:600])
+                elif c.get("type") == "tool_use":
+                    lbl = step_label(c.get("name", ""), c.get("input") or {})
+                    a["log"].append("→ " + lbl)
+                    a["last"] = lbl
+            st["dirty"] = True
         elif t == "assistant":
             for c in ev.get("message", {}).get("content", []):
                 if c.get("type") == "tool_use":
-                    st["steps"].append(step_label(c.get("name", ""), c.get("input") or {}))
+                    inp = c.get("input") or {}
+                    if c.get("name") in ("Task", "Agent"):
+                        name = inp.get("subagent_type") or "агент"
+                        if inp.get("description"):
+                            name += " · " + inp["description"][:40]
+                        agents[c.get("id")] = {"name": name, "log": [], "last": ""}
+                    st["steps"].append(step_label(c.get("name", ""), inp))
                     st["text"] = ""  # между шагами начинается новый текст
                     st["dirty"] = True
         elif t == "result":
             st["result"] = ev.get("result") or st["text"]
+            st["res"] = ev
             if ev.get("session_id"):
                 cfg["session"] = ev["session_id"]
                 if new_session:
@@ -210,6 +272,8 @@ def run_claude(chat_id, prompt):
     proc.wait()
     err = "".join(errlines)[-1500:]
     stopped = runs.pop(did)["stopped"]
+    last_agents.clear()
+    last_agents.update(agents)
 
     with fs_lock:
         try:
@@ -218,17 +282,56 @@ def run_claude(chat_id, prompt):
             added, removed = 0, 0
             err += f"\nСинхронизация с каналом: {e}"
 
+    # ---- статистика: токены, время, кредиты
+    sec = int(time.time() - started)
+    res, usage = st["res"], st["res"].get("usage") or {}
+    tin = usage.get("input_tokens", 0) + usage.get("cache_read_input_tokens", 0) + \
+        usage.get("cache_creation_input_tokens", 0)
+    tout = usage.get("output_tokens", 0)
+    bal1 = provider_balance() if bal0 else None
+    spent = round(bal0["left"] - bal1["left"], 4) if bal0 and bal1 else None
+    cost = spent if spent is not None else res.get("total_cost_usd")
+    stats = cfg.setdefault("stats", {"cost": 0.0, "in": 0, "out": 0, "runs": 0})
+    stats["cost"] += cost or 0; stats["in"] += tin; stats["out"] += tout; stats["runs"] += 1
+    cfg["last_run"] = {"cost": cost, "real": spent is not None, "in": tin, "out": tout, "sec": sec,
+                       "turns": res.get("num_turns", 0), "left": bal1["left"] if bal1 else None}
+    save_cfg()
+    info = [f"⏱ {sec} с", f"🔁 {res.get('num_turns', 0)} ходов", f"🔤 {fmt_k(tin)} → {fmt_k(tout)}"]
+    if cost is not None:
+        info.append(f"💰 ${cost:.4f}" + ("" if spent is not None else " (оценка)"))
+    if bal1:
+        info.append(f"остаток ${bal1['left']:.2f}")
+    if added or removed:
+        info.append(f"📁 +{added} −{removed}")
+    footer = "\n\n<i>" + " · ".join(info) + "</i>"
+
+    # ---- ход работы и агенты — сворачиваемыми блоками
+    details = ""
+    if st["steps"]:
+        details += "Шаги:\n" + "\n".join(f"{i + 1}. {x}" for i, x in enumerate(st["steps"]))
+    if st["thinking"].strip():
+        details += ("\n\n" if details else "") + "Размышления:\n" + st["thinking"].strip()
+    if details:
+        send_rich(chat_id, bq(f"🧠 <b>Ход работы</b> · {len(st['steps'])} шагов", details))
+    for a in agents.values():
+        if a["log"]:
+            send_rich(chat_id, bq(f"🧩 <b>{html.escape(a['name'])}</b>", "\n\n".join(a["log"])))
+
     if stopped:
-        tg("sendMessage", chat_id=chat_id, text="⏹ Остановлено.")
+        tg("sendMessage", chat_id=chat_id, text="⏹ Остановлено." + footer, parse_mode="HTML")
         return
     text = st["result"] or (f"Ошибка:\n```\n{err}\n```" if err else "(пустой ответ)")
-    footer = f"\n\n<i>📁 файлов изменено: {added}, удалено: {removed}</i>" if added or removed else ""
     parts = list(chunks(text))
     for i, part in enumerate(parts):
-        body = md_to_html(part) + (footer if i == len(parts) - 1 else "")
-        r = tg("sendRichMessage", chat_id=chat_id, rich_message={"html": body})
-        if not r.get("ok"):  # запасной путь для старых клиентов
-            tg("sendMessage", chat_id=chat_id, text=body, parse_mode="HTML")
+        send_rich(chat_id, md_to_html(part) + (footer if i == len(parts) - 1 else ""))
+
+
+def send_rich(chat_id, body):
+    r = tg("sendRichMessage", chat_id=chat_id, rich_message={"html": body})
+    if not r.get("ok"):  # запасной путь для старых клиентов
+        r = tg("sendMessage", chat_id=chat_id, text=body, parse_mode="HTML")
+        if not r.get("ok"):
+            tg("sendMessage", chat_id=chat_id, text=re.sub(r"<[^>]+>", "", body)[:4000])
 
 
 # ---------------- меню ----------------
@@ -396,6 +499,7 @@ HELP = """<b>Как пользоваться</b>
 /plan — режим плана · /mode — режим разрешений
 /compact /context /cost /init /review /security_review — команды Claude Code
 /stop — остановить · /status — состояние · /files — файлы
+/usage — кредиты и остаток · /agents — чаты агентов · /skills — навыки · /repair — починить канал
 /ecc — все команды Everything Claude Code (например /code_review, /plan_prd, /tdd)
 Любую команду ECC можно писать и через дефис: /code-review"""
 
@@ -434,6 +538,23 @@ def status_text():
             f"Сессия: <code>{s[:8] if s else 'новая'}</code> · задача: {'идёт' if runs else 'нет'}\n"
             f"ECC: {len(ecc_cmds)} команд, навыки {'вкл' if cfg.get('ecc_skills') else 'выкл'}\n"
             f"Диск: свободно {du.free // 2**20} МБ из {du.total // 2**20} МБ" + (f"\nПамять: {mem}" if mem else ""))
+
+
+def usage_text():
+    lr, stt = cfg.get("last_run"), cfg.get("stats") or {}
+    lines = [f"📊 <b>Расход</b> · {html.escape(cfg['provider'])} / <code>{html.escape(cfg['model'])}</code>"]
+    b = provider_balance()
+    if b:
+        lines.append("Баланс провайдера: " + ("безлимит" if b["unlimited"] else f"${b['left']:.2f}")
+                     + f" · всего потрачено ${b['used']:.2f}")
+    if lr:
+        c = f"${lr['cost']:.4f}" + ("" if lr.get("real") else " (оценка)") if lr.get("cost") is not None else "—"
+        lines.append(f"Последняя задача: {c} · {fmt_k(lr['in'])} → {fmt_k(lr['out'])} токенов · "
+                     f"{lr['sec']} с · {lr['turns']} ходов")
+    if stt:
+        lines.append(f"Через бота всего: ${stt.get('cost', 0):.4f} · {stt.get('runs', 0)} задач · "
+                     f"{fmt_k(stt.get('in', 0))} → {fmt_k(stt.get('out', 0))} токенов")
+    return "\n".join(lines)
 
 
 def handle_command(chat, text):
@@ -490,6 +611,29 @@ def handle_command(chat, text):
         else:
             lines = [f"/{n.replace('-', '_')} — {html.escape(d[:90])}" for n, d in sorted(ecc_cmds.items())]
             send_long(chat, "🧩 Команды Everything Claude Code:\n\n" + "\n".join(lines))
+    elif key in ("usage", "cost"):
+        tg("sendMessage", chat_id=chat, text=usage_text(), parse_mode="HTML")
+    elif key == "agents":
+        if not last_agents:
+            tg("sendMessage", chat_id=chat, text="В последней задаче агентов не было.")
+        for a in last_agents.values():
+            send_rich(chat, bq(f"🧩 <b>{html.escape(a['name'])}</b>", "\n\n".join(a["log"]) or "—"))
+    elif key == "skills":
+        d = os.path.join(CLAUDE_DIR, "skills")
+        names = sorted(os.listdir(d)) if os.path.isdir(d) else []
+        own = [n for n in names if not _ours(os.path.join(d, n))]
+        txt = (f"🧠 Навыков: {len(names)} (ECC: {len(names) - len(own)}, свои: {len(own)})\n"
+               + ("Свои: " + ", ".join(own) if own else "Своих пока нет — попроси: «создай навык для …»"))
+        send_long(chat, txt)
+    elif key == "repair":
+        with fs_lock:
+            try:
+                fs.idx["dir_text"] = {}
+                fs.rebuild_nav()
+                note = "🛠 Оглавление и index.json в канале восстановлены."
+            except Exception as e:
+                note = f"Не получилось: {e}"
+        tg("sendMessage", chat_id=chat, text=note)
     elif key in PASS:
         return (PASS[key] + " " + arg).strip()
     else:
@@ -674,18 +818,20 @@ def load_ecc_cmds():
         ecc_cmds[f[:-3]] = desc or f[:-3]
 
 
-def register_commands():
+def register_commands(limit=100):
     cmds = [{"command": c, "description": d} for c, d in BUILTIN]
     seen = {c for c, _ in BUILTIN}
     for n, d in sorted(ecc_cmds.items()):
         c = n.replace("-", "_").lower()
-        if len(cmds) >= 100 or c in seen or not re.fullmatch(r"[a-z0-9_]{1,32}", c):
+        if len(cmds) >= limit or c in seen or not re.fullmatch(r"[a-z0-9_]{1,32}", c):
             continue
         seen.add(c)
-        cmds.append({"command": c, "description": ("ECC: " + d)[:100]})
+        cmds.append({"command": c, "description": ("ECC: " + d)[:60]})
     r = tg("setMyCommands", commands=cmds)
     if not r.get("ok"):
-        print("setMyCommands:", r.get("description"), flush=True)
+        print("setMyCommands:", limit, r.get("description"), flush=True)
+        if "TOO_MUCH" in (r.get("description") or "") and limit > len(BUILTIN):
+            return register_commands(max(len(BUILTIN), limit - 20))  # остальные команды ECC — в /ecc
 
 
 def on_my_chat_member(u):
