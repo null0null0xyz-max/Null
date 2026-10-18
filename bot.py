@@ -359,6 +359,7 @@ def run_claude(chat_id, prompt, guest=False, who="владелец", mid=None):
             time.sleep(0.5)
 
     threading.Thread(target=drafter, daemon=True).start()
+    threading.Thread(target=cpu_throttle, args=(proc, runs[did]), daemon=True).start()
     errlines = []
 
     for line in proc.stdout:
@@ -501,10 +502,54 @@ def oom_first():
         pass
 
 
+CPU_LIMIT = float(os.environ.get("CLAUDE_CPU", "0.2"))  # доля ядра для Claude и его команд
+_CLK = os.sysconf("SC_CLK_TCK")
+
+
+def group_cpu(pgid):
+    """Суммарное CPU-время (с) всех процессов группы, включая завершившихся детей."""
+    tot = 0
+    for d in os.listdir("/proc"):
+        if not d.isdigit():
+            continue
+        try:
+            with open(f"/proc/{d}/stat") as f:
+                st = f.read().rsplit(")", 1)[1].split()
+        except Exception:
+            continue
+        if int(st[2]) == pgid:  # pgrp
+            tot += int(st[11]) + int(st[12]) + int(st[13]) + int(st[14])
+    return tot / _CLK
+
+
+def cpu_throttle(proc, run):
+    """Wispbyte гасит сервер за высокую нагрузку на CPU. Пока Claude работает, держим его группу
+    процессов в пределах CPU_LIMIT: если превысил — ненадолго замораживаем (SIGSTOP/SIGCONT)."""
+    if CPU_LIMIT <= 0:
+        return
+    last_t, last_c = time.time(), group_cpu(proc.pid)
+    while proc.poll() is None and not run.get("stopped"):
+        time.sleep(0.5)
+        now, c = time.time(), group_cpu(proc.pid)
+        used, dt = c - last_c, now - last_t
+        pause = used / CPU_LIMIT - dt
+        if pause > 0.05:
+            try:
+                os.killpg(proc.pid, 19)  # SIGSTOP
+                time.sleep(min(pause, 3))
+            finally:
+                try:
+                    os.killpg(proc.pid, 18)  # SIGCONT
+                except Exception:
+                    pass
+        last_t, last_c = time.time(), group_cpu(proc.pid)
+
+
 def kill_run(proc):
     """Остановить Claude и всё, что он запустил (вся группа процессов)."""
     try:
         os.killpg(proc.pid, 15)
+        os.killpg(proc.pid, 18)  # разморозить, если стоял на паузе ограничителя CPU
     except Exception:
         try:
             proc.terminate()
