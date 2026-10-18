@@ -315,9 +315,15 @@ def run_claude(chat_id, prompt, guest=False, who="владелец", mid=None):
         cmd += ["--resume", ch["session"]]
     env = claude_env()
     env.update(TG_CHAT=str(chat_id), TG_MSG=str(mid or ""), TG_STORAGE=str(CHANNEL))
+    # Память: на 512 МБ Claude Code (node) мог съесть всё, и Wispbyte гасил весь сервер.
+    # Ограничиваем кучу node, а ядру говорим убивать при нехватке в первую очередь Claude, а не бота.
+    heap = os.environ.get("CLAUDE_HEAP_MB", "320")
+    if "max-old-space-size" not in env.get("NODE_OPTIONS", ""):
+        env["NODE_OPTIONS"] = (env.get("NODE_OPTIONS", "") + f" --max-old-space-size={heap}").strip()
     try:
         proc = subprocess.Popen(cmd, cwd=WS, env=env, stdout=subprocess.PIPE, stdin=subprocess.DEVNULL,
-                                stderr=subprocess.STDOUT, text=True, bufsize=1, start_new_session=True)
+                                stderr=subprocess.STDOUT, text=True, bufsize=1, start_new_session=True,
+                                preexec_fn=oom_first)
     except FileNotFoundError:
         tg("sendMessage", chat_id=chat_id, text=f"Не найден {CLAUDE}. Проверь CLAUDE_BIN.")
         return
@@ -422,6 +428,11 @@ def run_claude(chat_id, prompt, guest=False, who="владелец", mid=None):
     except Exception:
         pass
     err = "".join(errlines)[-1500:]
+    if proc.returncode in (-9, 137) and not st["result"]:
+        err = ("Claude Code был убит из-за нехватки памяти на сервере. Бот работает. Попробуй ещё раз; "
+               "тяжёлые команды (сборки, npm, pip, сервера) пусть выполняются через rexec на Render.\n" + err)
+    elif "heap out of memory" in err.lower() and not st["result"]:
+        err = "Claude Code упёрся в лимит памяти (CLAUDE_HEAP_MB). Начни новую сессию /new или увеличь лимит.\n" + err
     stopped = runs.pop(did)["stopped"]
     last_agents.clear()
     last_agents.update(agents)
@@ -479,6 +490,15 @@ def run_claude(chat_id, prompt, guest=False, who="владелец", mid=None):
         tgctl.rich_send(chat_id, md, WS, reply_to=None if private else mid)
     if user_cmds_changed():
         register_commands()
+
+
+def oom_first():
+    """В дочернем процессе: при нехватке памяти ядро убьёт его, а не бота (повышать можно без root)."""
+    try:
+        with open("/proc/self/oom_score_adj", "w") as f:
+            f.write("1000")
+    except Exception:
+        pass
 
 
 def kill_run(proc):
