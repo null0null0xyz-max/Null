@@ -1,0 +1,30 @@
+name: claude
+run-name: claude task
+on:
+  workflow_dispatch:
+    inputs:
+      job:
+        description: task id
+        required: true
+      relay:
+        description: relay url
+        required: true
+permissions:
+  id-token: write
+  contents: read
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - name: prepare
+        run: |
+          sudo mkdir -p /home/container
+          sudo chown -R "$(id -u):$(id -g)" /home/container
+          git clone -q --depth 1 -b claude-bot "https://github.com/${GITHUB_REPOSITORY}" /home/container
+      - name: claude
+        env:
+          JOB: ${{ inputs.job }}
+          RELAY: ${{ inputs.relay }}
+        # весь вывод уходит только боту через реле, в публичный лог ничего не пишется
+        run: python3 /home/container/runner.py > /dev/null 2>&1
