@@ -9,8 +9,20 @@ Env: BOT_TOKEN, REXEC_URL, REXEC_TOKEN (OWNER_ID, CHANNEL_ID — необяза�
      необязательно: CLAUDE_BIN (по умолчанию "claude"), ANTHROPIC_API_KEY
 """
 from dotenv_min import load_env; load_env()
-import os, re, json, time, html, shutil, tarfile, mimetypes, threading, subprocess, itertools, requests
+import os, re, json, glob, time, html, shutil, tarfile, mimetypes, threading, subprocess, itertools, requests
+import importlib.machinery, importlib.util
 from tgfs import TgFS
+
+
+def _load_tgctl():
+    p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tgctl")
+    loader = importlib.machinery.SourceFileLoader("tgctl", p)
+    mod = importlib.util.module_from_spec(importlib.util.spec_from_loader("tgctl", loader))
+    loader.exec_module(mod)
+    return mod
+
+
+tgctl = _load_tgctl()
 
 TOKEN = os.environ["BOT_TOKEN"]
 CLAUDE = os.environ.get("CLAUDE_BIN", "claude")
@@ -21,8 +33,8 @@ API = f"https://api.telegram.org/bot{TOKEN}/"
 
 DEFAULT_CFG = {
     "providers": {"anthropic": {"base_url": "", "token": "", "models": ["sonnet", "opus", "haiku"]}},
-    "provider": "anthropic", "model": "sonnet", "session": None,
-    "effort": "", "mode": "bypass", "history": [], "ecc_skills": True,
+    "provider": "anthropic", "model": "sonnet", "chats": {},
+    "effort": "", "mode": "bypass", "ecc_skills": True,
 }
 EFFORTS = ["low", "medium", "high", "xhigh", "max"]
 MODES = {"bypass": "🚀 Всё разрешено", "plan": "📋 План (только чтение)", "acceptEdits": "✏️ Правки без Bash"}
@@ -32,8 +44,8 @@ ECC_PARTS = ("commands/", "agents/", "skills/", "rules/common/")
 # команды Claude Code, которые бот передаёт в Claude как есть (работают в -p)
 PASS = {"compact": "/compact", "context": "/context", "init": "/init",
         "review": "/review", "security_review": "/security-review"}
-BUILTIN = [("menu", "Модель, провайдеры, effort, режим"), ("new", "Новая сессия (= /clear)"),
-           ("clear", "Новая сессия"), ("resume", "Вернуться к прошлой сессии"),
+BUILTIN = [("menu", "Модель, провайдеры, effort, режим"), ("new", "Новая сессия"),
+           ("clear", "Очистить чат и удалить сессию"), ("resume", "Прошлые сессии"),
            ("effort", "Effort: low/medium/high/xhigh/max"), ("model", "Сменить модель"),
            ("mode", "Режим разрешений (план / всё)"), ("plan", "Включить/выключить режим плана"),
            ("compact", "Сжать контекст сессии"), ("context", "Сколько занято контекста"),
@@ -43,16 +55,9 @@ BUILTIN = [("menu", "Модель, провайдеры, effort, режим"), (
            ("files", "Файлы проекта"), ("usage", "Кредиты, токены, остаток"),
            ("agents", "Чаты агентов последней задачи"), ("skills", "Навыки"),
            ("repair", "Восстановить оглавление и index в канале"),
+           ("chats", "Группы и каналы, где я отвечаю"), ("prompt", "Инструкции для этого чата"),
            ("ecc", "Команды Everything Claude Code"),
            ("help", "Справка")]
-SYSTEM_HINT = (
-    "Рабочая папка проекта — текущая директория. Файлы читай и правь здесь. "
-    "Любые тяжёлые команды (установка пакетов, запуск, тесты, сборка) выполняй через "
-    'Bash: rexec "команда" — она выполнится на удалённой машине с копией папки, '
-    "изменённые файлы вернутся сюда. Отвечай по-русски. "
-    "Навыки лежат в ~/.claude/skills. Если пользователь просит или задача повторяется — можешь сам создать "
-    "новый навык: ~/.claude/skills/<имя>/SKILL.md (frontmatter name и description, дальше инструкция)."
-)
 TOOL_ICONS = {"Bash": "⚙️", "Read": "📖", "Write": "✏️", "Edit": "✏️", "MultiEdit": "✏️",
               "Grep": "🔎", "Glob": "🔎", "WebFetch": "🌐", "WebSearch": "🌐", "Task": "🧩", "Agent": "🧩", "Skill": "🧠", "TodoWrite": "📝"}
 
@@ -78,9 +83,76 @@ def save_cfg():
 
 def tg(method, **data):
     try:
-        return requests.post(API + method, json=data, timeout=60).json()
+        r = requests.post(API + method, json=data, timeout=60).json()
     except requests.RequestException as e:
         return {"ok": False, "description": str(e)}
+    res = r.get("result")
+    if r.get("ok") and method.startswith("send") and isinstance(res, dict) and res.get("message_id") \
+            and str(data.get("chat_id")) != str(CHANNEL):
+        tgctl.log_msg(data.get("chat_id"), res["message_id"], "bot", data.get("text") or "[" + method[4:] + "]")
+    return r
+
+
+CHAT_DEFAULT = {"session": None, "history": [], "access": "owner", "reply": "mention", "trust": False,
+                "title": "", "type": ""}
+
+
+def C(chat):
+    """Настройки и сессии конкретного чата (личка, группа, канал)."""
+    ch = cfg.setdefault("chats", {}).setdefault(str(chat), {})
+    for k, v in CHAT_DEFAULT.items():
+        ch.setdefault(k, list(v) if isinstance(v, list) else v)
+    return ch
+
+
+def chat_prompt(chat, value=None):
+    p = os.path.join(tgctl.PROMPT_DIR, f"{chat}.txt")
+    if value is not None:
+        os.makedirs(tgctl.PROMPT_DIR, exist_ok=True)
+        if value:
+            open(p, "w", encoding="utf-8").write(value)
+        elif os.path.exists(p):
+            os.remove(p)
+    return open(p, encoding="utf-8").read().strip() if os.path.exists(p) else ""
+
+
+def session_file(sid):
+    return glob.glob(os.path.join(CLAUDE_DIR, "projects", "*", f"{sid}.jsonl"))
+
+
+def delete_session(chat, sid):
+    for f in session_file(sid):
+        try:
+            os.remove(f)
+        except OSError:
+            pass
+    ch = C(chat)
+    ch["history"] = [h for h in ch["history"] if h["id"] != sid]
+    if ch["session"] == sid:
+        ch["session"] = None
+    save_cfg()
+
+
+def clear_chat(chat):
+    """Удалить сообщения чата (за 48 ч, что успел записать бот) и текущую сессию."""
+    p = os.path.join(tgctl.LOG_DIR, f"{chat}.jsonl")
+    ids = []
+    if os.path.exists(p):
+        now = time.time()
+        for line in open(p, encoding="utf-8"):
+            try:
+                e = json.loads(line)
+            except ValueError:
+                continue
+            if now - e.get("ts", 0) < 47 * 3600 and isinstance(e.get("id"), int):
+                ids.append(e["id"])
+        os.remove(p)
+    for i in range(0, len(ids), 100):
+        tg("deleteMessages", chat_id=chat, message_ids=ids[i:i + 100])
+    sid = C(chat)["session"]
+    if sid:
+        delete_session(chat, sid)
+    return len(ids)
 
 
 # ---------------- форматирование ----------------
@@ -166,50 +238,101 @@ def bq(title, body, limit=3300):
     return f"<blockquote expandable>{title}\n{html.escape(body)}</blockquote>"
 
 
-def run_claude(chat_id, prompt):
+def agents_md():
+    return "\n\n".join(details(f"🧩 {a['name']}", "\n\n".join(a["log"])[-6000:] or "—") for a in last_agents.values())
+
+
+def system_hint(chat, guest, who, mid):
+    ch = C(chat)
+    where = "личный чат с владельцем" if int(chat) > 0 else f"{ch['type']} «{ch['title']}»"
+    h = [f"Ты — Telegram-бот @{BOT_USERNAME} на базе Claude Code. Сейчас ты в чате: {where} (chat_id {chat}). "
+         f"Пишет: {who} (message_id {mid}). Отвечай по-русски, если пользователь не пишет на другом языке.",
+         "Твой ответ уйдёт в чат rich-сообщением в формате Markdown (GFM): можно заголовки #, таблицы, "
+         "блоки кода с языком, формулы $x^2$ и $$...$$, списки задач, ==выделение==, ||спойлер||, "
+         "<details><summary>Заголовок</summary>...</details> для сворачиваемых блоков. "
+         "Оформляй ответы, когда это помогает читать."]
+    if not guest:
+        h += ["Рабочая папка проекта — текущая директория, файлы читай и правь здесь; можно создавать и удалять "
+              "файлы и папки — изменения сами уйдут в канал-хранилище. Тяжёлые команды (установка пакетов, запуск, "
+              'тесты, сборка) выполняй через Bash: rexec "команда" — на удалённой машине с копией папки.',
+              "Графики и картинки: построй PNG (например matplotlib через rexec или локально) в папке проекта "
+              "и вставь в ответ строкой ![подпись](file:путь/к/файлу.png) — он прикрепится к сообщению.",
+              "Чатом управляешь через Bash-команду tgctl: tgctl history 30 (последние сообщения с id), "
+              'tgctl send "markdown", tgctl photo путь, tgctl file путь, tgctl pin ID, tgctl unpin ID|all, '
+              'tgctl delete ID..., tgctl edit ID "текст", tgctl react ID 👍, tgctl prompt "постоянные инструкции '
+              "для этого чата\", tgctl api МЕТОД '{json}'. В канал-хранилище ничего не отправляй — только файлы, "
+              "их синхронизирует бот.",
+              "Навыки: ~/.claude/skills. По просьбе или когда задача повторяется — создай навык "
+              "~/.claude/skills/<имя>/SKILL.md (frontmatter name, description, дальше инструкция). "
+              "Новая команда бота: ~/.claude/commands/<имя>.md (frontmatter description, дальше промпт; "
+              "$ARGUMENTS — аргументы) — бот сам добавит её в меню как /<имя>."]
+    else:
+        h.append("Это гость: доступа к серверу и файлам у тебя нет, просто отвечай в чате.")
+    p = chat_prompt(chat)
+    if p:
+        h.append("Инструкции владельца для этого чата: " + p)
+    return "\n".join(h)
+
+
+def run_claude(chat_id, prompt, guest=False, who="владелец", mid=None):
     did = next(draft_ids)
     started = time.time()
     st = {"steps": [], "text": "", "thinking": "", "result": "", "error": "", "dirty": True, "res": {}}
     agents = {}  # tool_use_id агента -> {"name", "log": [], "last": ""}
+    ch = C(chat_id)
+    private = int(chat_id) > 0
     bal0 = provider_balance()
     cmd = [CLAUDE, "-p", prompt, "--output-format", "stream-json", "--verbose",
            "--include-partial-messages", "--forward-subagent-text",
-           "--model", cfg["model"], "--append-system-prompt", SYSTEM_HINT]
+           "--model", cfg["model"], "--append-system-prompt", system_hint(chat_id, guest, who, mid)]
     mode = cfg.get("mode", "bypass")
-    cmd += ["--dangerously-skip-permissions"] if mode == "bypass" else ["--permission-mode", mode]
+    if guest:
+        cmd += ["--allowedTools", "WebSearch WebFetch",
+                "--disallowedTools", "Bash Edit Write MultiEdit NotebookEdit Read Grep Glob Task Agent"]
+    else:
+        cmd += ["--dangerously-skip-permissions"] if mode == "bypass" else ["--permission-mode", mode]
     if cfg.get("effort"):
         cmd += ["--effort", cfg["effort"]]
-    new_session = not cfg.get("session")
-    if cfg.get("session"):
-        cmd += ["--resume", cfg["session"]]
+    new_session = not ch["session"]
+    if ch["session"]:
+        cmd += ["--resume", ch["session"]]
+    env = claude_env()
+    env.update(TG_CHAT=str(chat_id), TG_MSG=str(mid or ""), TG_STORAGE=str(CHANNEL))
     try:
-        proc = subprocess.Popen(cmd, cwd=WS, env=claude_env(), stdout=subprocess.PIPE,
+        proc = subprocess.Popen(cmd, cwd=WS, env=env, stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT, text=True, bufsize=1)
     except FileNotFoundError:
         tg("sendMessage", chat_id=chat_id, text=f"Не найден {CLAUDE}. Проверь CLAUDE_BIN.")
         return
-    runs[did] = {"proc": proc, "stopped": False}
+    runs[did] = {"proc": proc, "stopped": False, "chat": chat_id}
 
-    def draft_html():
+    def draft_md():
         sec = int(time.time() - started)
-        steps = "\n".join(html.escape(x) for x in st["steps"][-5:])
-        status = f"Думаю · {sec} с · шагов {len(st['steps'])}" + (f"\n{steps}" if steps else "")
+        lines = [f"Думаю · {sec} с · шагов {len(st['steps'])}"] + st["steps"][-5:]
         for a in list(agents.values())[-3:]:
-            status += f"\n🧩 {html.escape(a['name'])}: {html.escape(a['last'][:70] or 'работает…')}"
+            lines.append(f"🧩 {a['name']}: {a['last'][:70] or 'работает…'}")
         if st["thinking"] and not st["text"]:
-            status += "\n" + html.escape(st["thinking"][-300:])
-        body = md_to_html(st["text"][-3000:]) if st["text"] else ""
-        return f"<tg-thinking>{status}</tg-thinking>{body}"
+            lines.append(st["thinking"][-300:])
+        status = "<br>".join(html.escape(x) for x in lines)
+        return f"<tg-thinking>{status}</tg-thinking>\n\n" + st["text"][-6000:]
 
     def drafter():
         # Плавное появление: частые обновления, пока идёт текст; не реже раза в 3 с (черновик живёт 30 с)
         last = 0
         while proc.poll() is None and not runs[did]["stopped"]:
+            if not private:
+                tg("sendChatAction", chat_id=chat_id, action="typing")
+                time.sleep(4)
+                continue
             if st["dirty"] or time.time() - last > 3:
                 st["dirty"] = False
                 last = time.time()
-                tg("sendRichMessageDraft", chat_id=chat_id, draft_id=did, can_stop=True,
-                   rich_message={"html": draft_html()})
+                r = tg("sendRichMessageDraft", chat_id=chat_id, draft_id=did, can_stop=True,
+                       rich_message={"markdown": draft_md()})
+                if not r.get("ok") and "parse" in (r.get("description") or "").lower():
+                    tg("sendRichMessageDraft", chat_id=chat_id, draft_id=did, can_stop=True,
+                       rich_message={"html": "<tg-thinking>" + html.escape(st["steps"][-1] if st["steps"] else "Думаю…")
+                                     + "</tg-thinking>"})
             time.sleep(0.7)
 
     threading.Thread(target=drafter, daemon=True).start()
@@ -261,11 +384,11 @@ def run_claude(chat_id, prompt):
             st["result"] = ev.get("result") or st["text"]
             st["res"] = ev
             if ev.get("session_id"):
-                cfg["session"] = ev["session_id"]
+                ch["session"] = ev["session_id"]
                 if new_session:
                     title = re.sub(r"\s+", " ", prompt.split("\n\nПриложены файлы")[0])[:40]
-                    cfg["history"] = ([{"id": ev["session_id"], "title": title, "ts": int(time.time())}]
-                                      + [h for h in cfg["history"] if h["id"] != ev["session_id"]])[:10]
+                    ch["history"] = ([{"id": ev["session_id"], "title": title, "ts": int(time.time())}]
+                                     + [h for h in ch["history"] if h["id"] != ev["session_id"]])[:10]
                 save_cfg()
             if ev.get("is_error"):
                 st["error"] = ev.get("subtype", "error")
@@ -296,38 +419,51 @@ def run_claude(chat_id, prompt):
     cfg["last_run"] = {"cost": cost, "real": spent is not None, "in": tin, "out": tout, "sec": sec,
                        "turns": res.get("num_turns", 0), "left": bal1["left"] if bal1 else None}
     save_cfg()
-    info = [f"⏱ {sec} с", f"🔁 {res.get('num_turns', 0)} ходов", f"🔤 {fmt_k(tin)} → {fmt_k(tout)}"]
+    info = [f"⏱ {sec} с", f"🔁 {res.get('num_turns', 0)}", f"🔤 {fmt_k(tin)} → {fmt_k(tout)}"]
     if cost is not None:
-        info.append(f"💰 ${cost:.4f}" + ("" if spent is not None else " (оценка)"))
+        info.append(f"💰 ${cost:.4f}" + ("" if spent is not None else "≈"))
     if bal1:
-        info.append(f"остаток ${bal1['left']:.2f}")
+        info.append(f"💳 ${bal1['left']:.2f}")
     if added or removed:
         info.append(f"📁 +{added} −{removed}")
-    footer = "\n\n<i>" + " · ".join(info) + "</i>"
+    footer = "<footer>" + "  •  ".join(info) + "</footer>"
 
-    # ---- ход работы и агенты — сворачиваемыми блоками
-    details = ""
-    if st["steps"]:
-        details += "Шаги:\n" + "\n".join(f"{i + 1}. {x}" for i, x in enumerate(st["steps"]))
-    if st["thinking"].strip():
-        details += ("\n\n" if details else "") + "Размышления:\n" + st["thinking"].strip()
-    if details:
-        send_rich(chat_id, bq(f"🧠 <b>Ход работы</b> · {len(st['steps'])} шагов", details))
+    # ---- ход работы и агенты — сворачиваемыми блоками <details> (стрелочка)
+    blocks = []
+    if st["steps"] or st["thinking"].strip():
+        body = "\n".join(f"{i + 1}. {md_esc(x)}" for i, x in enumerate(st["steps"][-60:]))
+        if st["thinking"].strip():
+            th = st["thinking"].strip()[-4000:]
+            body += "\n\n**Размышления**\n\n" + "\n".join("> " + md_esc(l) for l in th.splitlines() if l.strip())
+        blocks.append(details(f"🧠 Ход работы · {len(st['steps'])} шагов", body))
     for a in agents.values():
         if a["log"]:
-            send_rich(chat_id, bq(f"🧩 <b>{html.escape(a['name'])}</b>", "\n\n".join(a["log"])))
+            blocks.append(details(f"🧩 {a['name']}", "\n\n".join(a["log"])[-4000:]))
 
     if stopped:
-        tg("sendMessage", chat_id=chat_id, text="⏹ Остановлено." + footer, parse_mode="HTML")
-        return
-    text = st["result"] or (f"Ошибка:\n```\n{err}\n```" if err else "(пустой ответ)")
-    parts = list(chunks(text))
+        answer = "⏹ Остановлено."
+    else:
+        answer = st["result"] or (f"Ошибка:\n```\n{err}\n```" if err else "(пустой ответ)")
+    parts = list(chunks(answer, 28000))
     for i, part in enumerate(parts):
-        send_rich(chat_id, md_to_html(part) + (footer if i == len(parts) - 1 else ""))
+        md = ("\n\n".join(blocks) + "\n\n" if i == 0 and blocks else "") + part + \
+            ("\n\n" + footer if i == len(parts) - 1 else "")
+        tgctl.rich_send(chat_id, md, WS, reply_to=None if private else mid)
+    if user_cmds_changed():
+        register_commands()
+
+
+def md_esc(t):
+    return re.sub(r"([\\`*_\[\]<>|~=#$])", r"\\\1", t)
+
+
+def details(title, body):
+    return f"<details><summary>{html.escape(title)}</summary>\n\n{body}\n\n</details>"
 
 
 def send_rich(chat_id, body):
-    r = tg("sendRichMessage", chat_id=chat_id, rich_message={"html": body})
+    """HTML-текст (меню, справка): переводы строк -> <br>, т.к. rich HTML их схлопывает."""
+    r = tg("sendRichMessage", chat_id=chat_id, rich_message={"html": body.replace("\n", "<br>")})
     if not r.get("ok"):  # запасной путь для старых клиентов
         r = tg("sendMessage", chat_id=chat_id, text=body, parse_mode="HTML")
         if not r.get("ok"):
@@ -347,7 +483,8 @@ def menu_main():
             kb([[("🧠 Модель", "models"), ("🔌 Провайдеры", "provs")],
                 [("⚡ Effort", "effort"), ("🛡 Режим", "mode")],
                 [("🆕 Новая сессия", "new"), ("📜 Сессии", "sess")],
-                [("🧩 ECC", "ecc"), ("📁 Синхронизировать", "sync")]]))
+                [("👥 Группы и каналы", "chats"), ("🧩 ECC", "ecc")],
+                [("📁 Синхронизировать", "sync")]]))
 
 
 def menu_effort():
@@ -363,14 +500,39 @@ def menu_mode():
     return "Режим разрешений:", kb(rows + [[("⬅️ Назад", "main")]])
 
 
-def menu_sessions():
-    rows = []
-    for h in cfg["history"]:
-        mark = "✅ " if h["id"] == cfg.get("session") else ""
+def menu_sessions(chat):
+    ch, rows = C(chat), []
+    for h in ch["history"]:
+        mark = "✅ " if h["id"] == ch["session"] else ""
         when = time.strftime("%d.%m %H:%M", time.localtime(h["ts"]))
-        rows.append([(f"{mark}{when} · {h['title'] or '…'}", "r:" + h["id"])])
-    text = "Прошлые сессии — нажми, чтобы продолжить:" if rows else "Сессий пока нет."
+        rows.append([(f"{mark}{when} · {h['title'] or '…'}", "r:" + h["id"]), ("🗑", "rd:" + h["id"])])
+    text = "Сессии — нажми, чтобы продолжить, 🗑 — удалить:" if rows else "Сессий пока нет."
+    return text, kb(rows + [[("🧹 Очистить чат и удалить текущую", "clear")], [("⬅️ Назад", "main")]])
+
+
+def menu_chats():
+    rows = []
+    for cid, ch in cfg.get("chats", {}).items():
+        if ch.get("type") in ("group", "supergroup", "channel"):
+            icon = "📢" if ch["type"] == "channel" else "👥"
+            rows.append([(f"{icon} {ch.get('title') or cid}", "ch:" + cid)])
+    text = ("Чаты, где я есть. Добавь меня в группу или канал — он появится тут." if not rows
+            else "Группы и каналы — нажми, чтобы настроить:")
     return text, kb(rows + [[("⬅️ Назад", "main")]])
+
+
+def menu_chat(cid):
+    ch = C(cid)
+    acc = {"owner": "👤 только ты", "all": "👥 все"}[ch["access"]]
+    rep_ = {"mention": "🔔 по @упоминанию/ответу", "all": "💬 на все сообщения"}[ch["reply"]]
+    pr = chat_prompt(cid)
+    text = (f"<b>{html.escape(ch.get('title') or cid)}</b>\nКто может писать: {acc}\nКогда отвечаю: {rep_}\n"
+            f"Доступ к серверу и файлам: {'✅ да' if ch['trust'] else '❌ нет (только чат)'}\n"
+            f"Инструкции: {html.escape(pr[:300]) if pr else '— (задать: /prompt в том чате или скажи мне там)'}")
+    return text, kb([[("Кто пишет: " + acc, "ca:" + cid)], [("Когда: " + rep_, "cr:" + cid)],
+                     [("Сервер: " + ("✅" if ch["trust"] else "❌"), "ct:" + cid)],
+                     [("🧹 Сбросить инструкции", "cp:" + cid), ("🆕 Новая сессия", "cn:" + cid)],
+                     [("⬅️ Назад", "chats")]])
 
 
 def menu_ecc():
@@ -426,20 +588,43 @@ def on_callback(q):
     elif d.startswith("p:") and d[2:] in cfg["providers"]:
         cfg["provider"] = d[2:]
         cfg["model"] = cfg["providers"][d[2:]]["models"][0]
-        cfg["session"] = None  # сессии разных провайдеров несовместимы
+        for c in cfg.get("chats", {}).values():
+            c["session"] = None  # сессии разных провайдеров несовместимы
         save_cfg(); note = "Провайдер: " + d[2:]
         show(chat, mid, menu_main())
     elif d.startswith("del:"):
         cfg["providers"].pop(d[4:], None)
         if cfg["provider"] not in cfg["providers"]:
-            cfg.update(provider="anthropic", model="sonnet", session=None)
+            cfg.update(provider="anthropic", model="sonnet")
         save_cfg(); note = "Удалён"
         show(chat, mid, menu_provs())
     elif d == "add":
         waiting[OWNER] = "add_provider"
         tg("sendMessage", chat_id=chat, text=ADD_HELP, parse_mode="HTML")
     elif d == "new":
-        cfg["session"] = None; save_cfg(); note = "Новая сессия"
+        C(chat)["session"] = None; save_cfg(); note = "Новая сессия"
+    elif d == "clear":
+        n = clear_chat(chat); note = f"Удалено сообщений: {n}"
+        return tg("answerCallbackQuery", callback_query_id=q["id"], text=note)
+    elif d.startswith("rd:"):
+        delete_session(chat, d[3:]); note = "Сессия удалена"
+        show(chat, mid, menu_sessions(chat))
+    elif d == "chats":
+        show(chat, mid, menu_chats())
+    elif d[:3] in ("ch:", "ca:", "cr:", "ct:", "cp:", "cn:"):
+        cid, ch = d[3:], C(d[3:])
+        if d.startswith("ca:"):
+            ch["access"] = "all" if ch["access"] == "owner" else "owner"
+        elif d.startswith("cr:"):
+            ch["reply"] = "all" if ch["reply"] == "mention" else "mention"
+        elif d.startswith("ct:"):
+            ch["trust"] = not ch["trust"]
+        elif d.startswith("cp:"):
+            chat_prompt(cid, "")
+        elif d.startswith("cn:"):
+            ch["session"] = None
+        save_cfg()
+        show(chat, mid, menu_chat(cid))
     elif d == "effort":
         show(chat, mid, menu_effort())
     elif d.startswith("e:"):
@@ -451,9 +636,9 @@ def on_callback(q):
         cfg["mode"] = d[3:]; save_cfg(); note = MODES[d[3:]]
         show(chat, mid, menu_main())
     elif d == "sess":
-        show(chat, mid, menu_sessions())
+        show(chat, mid, menu_sessions(chat))
     elif d.startswith("r:"):
-        cfg["session"] = d[2:]; save_cfg(); note = "Продолжаю эту сессию"
+        C(chat)["session"] = d[2:]; save_cfg(); note = "Продолжаю эту сессию"
         show(chat, mid, menu_main())
     elif d == "ecc":
         show(chat, mid, menu_ecc())
@@ -494,22 +679,25 @@ HELP = """<b>Как пользоваться</b>
 
 <b>Команды</b>
 /menu — модель, провайдеры, effort, режим, ECC
-/new или /clear — новая сессия · /resume — прошлые сессии
+/new — новая сессия · /clear — очистить чат и удалить сессию · /resume — сессии (🗑 удалить)
 /effort high — уровень размышлений · /model имя — модель
 /plan — режим плана · /mode — режим разрешений
-/compact /context /cost /init /review /security_review — команды Claude Code
+/compact /context /init /review /security_review — команды Claude Code
 /stop — остановить · /status — состояние · /files — файлы
 /usage — кредиты и остаток · /agents — чаты агентов · /skills — навыки · /repair — починить канал
+/chats — группы и каналы · /prompt текст — инструкции для чата
+📊 Внизу ответа: время • ходы • токены • 💰 списано • 💳 остаток
 /ecc — все команды Everything Claude Code (например /code_review, /plan_prd, /tdd)
 Любую команду ECC можно писать и через дефис: /code-review"""
 
 
-def start_task(chat, prompt):
+def start_task(chat, prompt, guest=False, who="владелец", mid=None):
     if not CHANNEL:
         return tg("sendMessage", chat_id=chat, text="Сначала добавь меня админом в канал для файлов.")
     if runs:
-        return tg("sendMessage", chat_id=chat, text="Ещё работаю над прошлой задачей — нажми Stop или /stop.")
-    threading.Thread(target=run_claude, args=(chat, prompt), daemon=True).start()
+        return tg("sendMessage", chat_id=chat, text="Ещё работаю над прошлой задачей — подожди или /stop.",
+                  **({"reply_parameters": {"message_id": mid, "allow_sending_without_reply": True}} if mid else {}))
+    threading.Thread(target=run_claude, args=(chat, prompt, guest, who, mid), daemon=True).start()
 
 
 def send_long(chat, text, **kw):
@@ -517,7 +705,7 @@ def send_long(chat, text, **kw):
         tg("sendMessage", chat_id=chat, text=part, **kw)
 
 
-def status_text():
+def status_text(chat):
     try:
         ver = subprocess.run([CLAUDE, "--version"], capture_output=True, text=True, timeout=30).stdout.strip()
     except Exception as e:
@@ -531,7 +719,7 @@ def status_text():
                 break
     except Exception:
         pass
-    s = cfg.get("session")
+    s = C(chat)["session"]
     return (f"🤖 Claude Code: <code>{html.escape(ver or '?')}</code>\n"
             f"Провайдер: <code>{html.escape(cfg['provider'])}</code> · модель <code>{html.escape(cfg['model'])}</code>\n"
             f"Effort: {cfg.get('effort') or 'авто'} · режим: {MODES.get(cfg['mode'])}\n"
@@ -568,11 +756,25 @@ def handle_command(chat, text):
         tg("sendMessage", chat_id=chat, text=t, parse_mode="HTML", reply_markup=m)
     elif key == "help":
         tg("sendMessage", chat_id=chat, text=HELP, parse_mode="HTML")
-    elif key in ("new", "clear"):
-        cfg["session"] = None; save_cfg()
+    elif key == "new":
+        C(chat)["session"] = None; save_cfg()
         tg("sendMessage", chat_id=chat, text="🆕 Новая сессия")
+    elif key == "clear":
+        clear_chat(chat)
+        tg("sendMessage", chat_id=chat, text="🧹 Чат очищен, сессия удалена.")
+    elif key == "chats":
+        t, m = menu_chats()
+        tg("sendMessage", chat_id=chat, text=t, reply_markup=m)
+    elif key == "prompt":
+        if arg in ("off", "сброс", "-"):
+            chat_prompt(chat, ""); tg("sendMessage", chat_id=chat, text="Инструкции чата сброшены.")
+        elif arg:
+            chat_prompt(chat, arg); tg("sendMessage", chat_id=chat, text="✅ Запомнил, как вести себя в этом чате.")
+        else:
+            tg("sendMessage", chat_id=chat, text="Инструкции чата: " + (chat_prompt(chat) or "—") +
+               "\nЗадать: /prompt текст · сбросить: /prompt off")
     elif key == "resume":
-        t, m = menu_sessions()
+        t, m = menu_sessions(chat)
         tg("sendMessage", chat_id=chat, text=t, reply_markup=m)
     elif key == "effort":
         if arg in EFFORTS or arg in ("auto", "авто", "off"):
@@ -600,7 +802,7 @@ def handle_command(chat, text):
             r["proc"].terminate()
         tg("sendMessage", chat_id=chat, text="⏹ Останавливаю." if runs else "Сейчас ничего не выполняется.")
     elif key == "status":
-        tg("sendMessage", chat_id=chat, text=status_text(), parse_mode="HTML")
+        tg("sendMessage", chat_id=chat, text=status_text(chat), parse_mode="HTML")
     elif key == "files":
         paths = sorted(fs.idx.get("files", {}).keys()) or \
             sorted(os.path.relpath(os.path.join(d, f), WS) for d, _, fs_ in os.walk(WS) for f in fs_)
@@ -616,8 +818,8 @@ def handle_command(chat, text):
     elif key == "agents":
         if not last_agents:
             tg("sendMessage", chat_id=chat, text="В последней задаче агентов не было.")
-        for a in last_agents.values():
-            send_rich(chat, bq(f"🧩 <b>{html.escape(a['name'])}</b>", "\n\n".join(a["log"]) or "—"))
+        else:
+            tgctl.rich_send(chat, agents_md(), WS)
     elif key == "skills":
         d = os.path.join(CLAUDE_DIR, "skills")
         names = sorted(os.listdir(d)) if os.path.isdir(d) else []
@@ -638,7 +840,7 @@ def handle_command(chat, text):
         return (PASS[key] + " " + arg).strip()
     else:
         # команда ECC или любая другая слэш-команда Claude Code: /code_review → /code-review
-        real = next((n for n in ecc_cmds if n.replace("-", "_") == key), name)
+        real = next((n for n in list(user_cmds) + list(ecc_cmds) if n.replace("-", "_") == key), name)
         return ("/" + real + " " + arg).strip()
     return None
 
@@ -715,28 +917,66 @@ def collect_media(msg, media):
     item["timer"].start()
 
 
-def on_message(msg):
+def who_of(msg):
+    f = msg.get("from") or {}
+    name = (f.get("first_name", "") + " " + f.get("last_name", "")).strip() or msg.get("author_signature") \
+        or (msg.get("sender_chat") or {}).get("title") or "?"
+    return name + (f" @{f['username']}" if f.get("username") else "") + (" (владелец)" if f.get("id") == OWNER else "")
+
+
+def addressed(msg, text):
+    """Обращение к боту в группе/канале: команда, @упоминание или ответ на сообщение бота."""
+    if text.startswith("/"):
+        head = text.split()[0]
+        return "@" not in head or head.lower().endswith("@" + BOT_USERNAME.lower())
+    if BOT_USERNAME and "@" + BOT_USERNAME.lower() in text.lower():
+        return True
+    return (msg.get("reply_to_message") or {}).get("from", {}).get("id") == BOT_ID
+
+
+def on_message(msg, channel=False):
     global OWNER
-    if not OWNER and msg.get("chat", {}).get("type") == "private" and msg.get("text") == "/start":
+    chat_o = msg["chat"]
+    chat, ctype = chat_o["id"], chat_o["type"]
+    text = (msg.get("text") or msg.get("caption") or "").strip()
+    if not OWNER and ctype == "private" and text == "/start":
         OWNER = cfg["owner"] = msg["from"]["id"]
         save_cfg()
         tg("sendMessage", chat_id=OWNER, text="👋 Ты владелец. Теперь добавь меня админом в приватный канал для файлов.")
-    if msg.get("from", {}).get("id") != OWNER:
+    from_owner = (msg.get("from") or {}).get("id") == OWNER
+    if ctype == "private" and not from_owner:
         return
-    chat = msg["chat"]["id"]
-    if msg.get("text") and waiting.pop(OWNER, None) == "add_provider":
+    ch = C(chat)
+    ch["type"], ch["title"] = ctype, chat_o.get("title") or chat_o.get("first_name", "")
+    tgctl.log_msg(chat, msg["message_id"], who_of(msg), text or "[медиа]")
+
+    if ctype == "private":
+        if not from_owner:
+            return
+        guest = False
+    else:
+        if not (addressed(msg, text) or ch["reply"] == "all"):
+            return
+        if not from_owner and not channel and ch["access"] != "all":
+            return
+        guest = not from_owner and not ch["trust"]
+        if BOT_USERNAME:
+            text = re.sub("@" + re.escape(BOT_USERNAME), "", text, flags=re.I).strip()
+
+    if from_owner and msg.get("text") and waiting.pop(OWNER, None) == "add_provider":
         return add_provider(msg)
     media = media_of(msg)
-    if media:
+    if media and not guest:
         return collect_media(msg, media)
-    text = (msg.get("text") or "").strip()
     if not text:
         return
     if text.startswith("/"):
+        if guest and not text.startswith(("/help", "/start")):
+            return
         text = handle_command(chat, text)
         if not text:
             return
-    start_task(chat, text)
+    start_task(chat, text, guest=guest, who=who_of(msg), mid=msg["message_id"])
 
 
 # ---------------- Everything Claude Code (affaan-m/ECC) ----------------
@@ -818,9 +1058,45 @@ def load_ecc_cmds():
         ecc_cmds[f[:-3]] = desc or f[:-3]
 
 
+user_cmds = {}  # свои команды из ~/.claude/commands (не ECC)
+
+
+def load_user_cmds():
+    found = {}
+    d = os.path.join(CLAUDE_DIR, "commands")
+    if os.path.isdir(d):
+        for f in sorted(os.listdir(d)):
+            p = os.path.join(d, f)
+            if not f.endswith(".md") or _ours(p):
+                continue
+            desc = ""
+            try:
+                for line in open(p, encoding="utf-8", errors="ignore").read(3000).splitlines():
+                    if line.startswith("description:"):
+                        desc = line.split(":", 1)[1].strip().strip('"\'')
+                        break
+            except OSError:
+                pass
+            found[f[:-3]] = desc or f[:-3]
+    return found
+
+
+def user_cmds_changed():
+    new = load_user_cmds()
+    if new != user_cmds:
+        user_cmds.clear(); user_cmds.update(new)
+        return True
+    return False
+
+
 def register_commands(limit=100):
     cmds = [{"command": c, "description": d} for c, d in BUILTIN]
     seen = {c for c, _ in BUILTIN}
+    for n, d in sorted(user_cmds.items()):
+        c = n.replace("-", "_").lower()
+        if c not in seen and re.fullmatch(r"[a-z0-9_]{1,32}", c):
+            seen.add(c)
+            cmds.append({"command": c, "description": ("⭐ " + d)[:60]})
     for n, d in sorted(ecc_cmds.items()):
         c = n.replace("-", "_").lower()
         if len(cmds) >= limit or c in seen or not re.fullmatch(r"[a-z0-9_]{1,32}", c):
@@ -837,6 +1113,16 @@ def register_commands(limit=100):
 def on_my_chat_member(u):
     global CHANNEL
     chat, new = u["chat"], u["new_chat_member"]
+    if chat["type"] != "private" and str(chat["id"]) != str(CHANNEL):
+        if new["status"] in ("left", "kicked"):
+            cfg.get("chats", {}).pop(str(chat["id"]), None); save_cfg()
+        elif CHANNEL or chat["type"] != "channel":
+            ch = C(chat["id"]); ch["type"], ch["title"] = chat["type"], chat.get("title", "")
+            save_cfg()
+            if u["from"]["id"] == OWNER:
+                tg("sendMessage", chat_id=OWNER, text=f"👥 Меня добавили в «{chat.get('title', '')}». "
+                   "Отвечаю там на @упоминания и ответы. Настройки: /chats")
+            return
     if chat["type"] == "channel" and not CHANNEL and new["status"] == "administrator" \
             and u["from"]["id"] == OWNER:
         CHANNEL = cfg["channel"] = str(chat["id"])
@@ -860,13 +1146,26 @@ def ensure_claude():
         CLAUDE = local
 
 
+BOT_ID, BOT_USERNAME = 0, ""
+
+
 def main():
+    global BOT_ID, BOT_USERNAME
+    me = tg("getMe").get("result") or {}
+    BOT_ID, BOT_USERNAME = me.get("id", 0), me.get("username", "")
+    if OWNER and ("session" in cfg or "history" in cfg):  # перенос старых сессий в личный чат
+        ch = C(OWNER); ch["type"] = "private"
+        ch["session"] = ch["session"] or cfg.get("session")
+        ch["history"] = ch["history"] or cfg.get("history") or []
+    cfg.pop("session", None); cfg.pop("history", None)
+    os.chmod(os.path.join(HERE, "tgctl"), 0o755)
     save_cfg()
     ensure_claude()
     if CHANNEL:
         fs.load()
         fs.restore()
     load_ecc_cmds()
+    user_cmds_changed()
     register_commands()
     threading.Thread(target=lambda: (install_ecc(), register_commands()), daemon=True).start()
     print("bot started", flush=True)
@@ -893,6 +1192,8 @@ def main():
                 elif "channel_post" in u and str(u["channel_post"]["chat"]["id"]) == str(CHANNEL):
                     with fs_lock:
                         fs.on_channel_post(u["channel_post"])
+                elif "channel_post" in u:
+                    on_message(u["channel_post"], channel=True)
                 elif "message" in u:
                     on_message(u["message"])
             except Exception as e:
