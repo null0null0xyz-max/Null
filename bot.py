@@ -9,7 +9,7 @@ Env: BOT_TOKEN, REXEC_URL, REXEC_TOKEN (OWNER_ID, CHANNEL_ID — необяза�
      необязательно: CLAUDE_BIN (по умолчанию "claude"), ANTHROPIC_API_KEY
 """
 from dotenv_min import load_env; load_env()
-import os, re, json, glob, time, html, shutil, tarfile, mimetypes, threading, subprocess, itertools, requests
+import os, re, io, json, glob, time, html, queue, base64, shutil, secrets, tarfile, mimetypes, threading, subprocess, itertools, requests
 import importlib.machinery, importlib.util
 from tgfs import TgFS
 
@@ -51,7 +51,7 @@ BUILTIN = [("menu", "Модель, провайдеры, effort, режим"), (
            ("compact", "Сжать контекст сессии"), ("context", "Сколько занято контекста"),
            ("init", "Создать CLAUDE.md для проекта"),
            ("review", "Ревью кода"), ("security_review", "Проверка безопасности"),
-           ("stop", "Остановить задачу"), ("status", "Состояние бота и сервера"),
+           ("stop", "Остановить задачу"), ("where", "Где работает Claude: GitHub или здесь"), ("status", "Состояние бота и сервера"),
            ("files", "Файлы проекта"), ("usage", "Кредиты, токены, остаток"),
            ("agents", "Чаты агентов последней задачи"), ("skills", "Навыки"),
            ("repair", "Восстановить оглавление и index в канале"),
@@ -321,17 +321,25 @@ def run_claude(chat_id, prompt, guest=False, who="владелец", mid=None):
     if "max-old-space-size" not in env.get("NODE_OPTIONS", ""):
         env["NODE_OPTIONS"] = (env.get("NODE_OPTIONS", "") + f" --max-old-space-size={heap}").strip()
     try:
-        proc = subprocess.Popen(cmd, cwd=WS, env=env, stdout=subprocess.PIPE, stdin=subprocess.DEVNULL,
-                                stderr=subprocess.STDOUT, text=True, bufsize=1, start_new_session=True,
-                                preexec_fn=oom_first)
+        if remote_on():
+            proc = RemoteProc(cmd, env, ch["session"])
+        else:
+            proc = subprocess.Popen(cmd, cwd=WS, env=env, stdout=subprocess.PIPE, stdin=subprocess.DEVNULL,
+                                    stderr=subprocess.STDOUT, text=True, bufsize=1, start_new_session=True,
+                                    preexec_fn=oom_first)
     except FileNotFoundError:
         tg("sendMessage", chat_id=chat_id, text=f"Не найден {CLAUDE}. Проверь CLAUDE_BIN.")
+        return
+    except Exception as e:
+        tg("sendMessage", chat_id=chat_id, text=f"Не удалось запустить Claude: {e}")
         return
     runs[did] = {"proc": proc, "stopped": False, "chat": chat_id}
 
     def draft_md():
         sec = int(time.time() - started)
         lines = [f"Думаю · {sec} с · шагов {len(st['steps'])}"] + st["steps"][-5:]
+        if st.get("phase") and not st["steps"] and not st["text"]:
+            lines.append("☁️ " + st["phase"])
         for a in list(agents.values())[-3:]:
             lines.append(f"🧩 {a['name']}: {a['last'][:70] or 'работает…'}")
         if st["thinking"] and not st["text"]:
@@ -369,6 +377,10 @@ def run_claude(chat_id, prompt, guest=False, who="владелец", mid=None):
             errlines.append(line)
             continue
         t, pid = ev.get("type"), ev.get("parent_tool_use_id")
+        if t == "_status":
+            st["phase"] = ev.get("text", "")
+            st["dirty"] = True
+            continue
         if t == "stream_event" and not pid:
             e = ev.get("event", {})
             if e.get("type") == "content_block_delta":
@@ -493,6 +505,178 @@ def run_claude(chat_id, prompt, guest=False, who="владелец", mid=None):
         register_commands()
 
 
+# ---------------- Claude на машине GitHub Actions ----------------
+# Бот остаётся на Wispbyte (лёгкий, 24/7), а сам Claude Code запускается на каждую задачу в GitHub Actions
+# (4 ядра, 16 ГБ). Render-реле передаёт задачу и поток событий. Без GH_TOKEN — всё как раньше, локально.
+GH_TOKEN = os.environ.get("GH_TOKEN", "")
+GH_REPO = os.environ.get("GH_REPO", "null0null0xyz-max/Null")
+GH_REF = os.environ.get("GH_REF", "main")
+PACK_SKIP = {".git", "node_modules", "__pycache__", ".venv", "venv", ".cache"}
+CLAUDE_SKIP = {"projects", "shell-snapshots", "statsig", "todos", "ide", "cache", "local", "downloads",
+               "debug", "telemetry", "logs", "plugins"}
+ENV_PASS = ("ANTHROPIC_", "CLAUDE_CODE_", "TG_", "BOT_TOKEN", "REXEC_", "WORKSPACE", "MAX_THINKING")
+
+
+def remote_on():
+    return bool(GH_TOKEN and os.environ.get("REXEC_URL")) and cfg.get("where", "github") == "github"
+
+
+def _walk(top, skip):
+    for root, dirs, files in os.walk(top):
+        dirs[:] = [d for d in dirs if d not in skip]
+        for n in files:
+            yield os.path.join(root, n)
+
+
+class RemoteProc:
+    """Похоже на subprocess.Popen: .stdout (строки stream-json), poll(), wait(), returncode."""
+    pid = None
+
+    def __init__(self, cmd, env, session):
+        self.url = os.environ["REXEC_URL"].rstrip("/")
+        self.hdr = {"X-Token": os.environ.get("REXEC_TOKEN", "")}
+        self.job = secrets.token_hex(16)
+        self.returncode = None
+        self.q = queue.Queue()
+        self.done = threading.Event()
+        self.applied = False
+        self.sent_ws = set()
+        home = os.path.expanduser("~")
+        payload = {"cmd": cmd, "home": home, "here": HERE, "ws": WS, "ecc_dir": ECC_DIR,
+                   "extra_dirs": [os.path.join(HERE, "chatlog"), os.path.join(HERE, "chat_prompts")],
+                   "env": {k: v for k, v in env.items() if k.startswith(ENV_PASS)},
+                   "tar": base64.b64encode(self._pack(home, session)).decode()}
+        payload["env"]["WORKSPACE"] = WS
+        for i in range(8):  # Render может просыпаться
+            try:
+                r = requests.post(f"{self.url}/relay/{self.job}/in", data=json.dumps(payload),
+                                  headers=self.hdr, timeout=60)
+                if r.ok:
+                    break
+                raise RuntimeError(f"реле: {r.status_code} {r.text[:200]}")
+            except requests.RequestException:
+                time.sleep(8)
+        else:
+            raise RuntimeError("Render-реле не отвечает")
+        r = requests.post(f"https://api.github.com/repos/{GH_REPO}/actions/workflows/claude.yml/dispatches",
+                          json={"ref": GH_REF, "inputs": {"job": self.job, "relay": self.url}}, timeout=30,
+                          headers={"Authorization": "Bearer " + GH_TOKEN, "Accept": "application/vnd.github+json"})
+        if r.status_code != 204:
+            raise RuntimeError(f"GitHub не запустил задачу: {r.status_code} {r.text[:300]}")
+        self.q.put(json.dumps({"type": "_status", "text": "жду машину GitHub"}) + "\n")
+        self.stdout = self._lines()
+        threading.Thread(target=self._poll, daemon=True).start()
+
+    def _pack(self, home, session):
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w:gz") as t:
+            def add(p):
+                try:
+                    if os.path.islink(p) or os.path.getsize(p) < 50_000_000:
+                        t.add(p, arcname=p.lstrip("/"), recursive=False)
+                except OSError:
+                    pass
+            for p in _walk(WS, PACK_SKIP):
+                self.sent_ws.add(os.path.relpath(p, WS))
+                add(p)
+            cd = os.path.join(home, ".claude")
+            for p in _walk(cd, CLAUDE_SKIP):
+                add(p)
+            if session:  # только нужная сессия, а не вся история
+                proj = os.path.join(cd, "projects", re.sub(r"[^A-Za-z0-9]", "-", WS))
+                for p in [os.path.join(proj, session + ".jsonl")] + list(_walk(os.path.join(proj, session), set())):
+                    if os.path.exists(p):
+                        add(p)
+            for d in ("chatlog", "chat_prompts"):
+                for p in _walk(os.path.join(HERE, d), set()):
+                    add(p)
+            if os.path.exists(os.path.join(home, ".claude.json")):
+                add(os.path.join(home, ".claude.json"))
+        return buf.getvalue()
+
+    def _lines(self):
+        while True:
+            line = self.q.get()
+            if line is None:
+                return
+            yield line
+
+    def _poll(self):
+        n, t0, started = 0, time.time(), False
+        while True:
+            try:
+                j = requests.get(f"{self.url}/relay/{self.job}/ev", params={"from": n},
+                                 headers=self.hdr, timeout=40).json()
+            except Exception:
+                time.sleep(3)
+                if time.time() - t0 > 6 * 3600:
+                    break
+                continue
+            started = started or j.get("started")
+            for line in j.get("lines", []):
+                try:
+                    ev = json.loads(line)
+                except ValueError:
+                    ev = {}
+                if ev.get("type") == "_done":
+                    self.returncode = ev.get("code", 0)
+                    if ev.get("error"):
+                        self.q.put(ev["error"] + "\n")
+                    continue
+                self.q.put(line + "\n")
+            n = j.get("next", n)
+            if j.get("done"):
+                break
+            if not started and time.time() - t0 > 300:
+                self.q.put("GitHub Actions не взял задачу за 5 минут.\n")
+                self.returncode = 1
+                break
+        if self.returncode is None:
+            self.returncode = 1
+        self.done.set()
+        self.q.put(None)
+
+    def poll(self):
+        return self.returncode if self.done.is_set() else None
+
+    def wait(self, timeout=None):
+        self.done.wait(max(timeout or 0, 240))  # файлы возвращаются после ответа
+        self._apply()
+        return self.returncode
+
+    def _apply(self):
+        if self.applied or not self.done.is_set():
+            return
+        self.applied = True
+        try:
+            r = requests.get(f"{self.url}/relay/{self.job}/out", headers=self.hdr, timeout=120)
+            if not r.content:
+                return
+            with tarfile.open(fileobj=io.BytesIO(r.content), mode="r:gz") as t:
+                man = None
+                members = []
+                for m in t.getmembers():
+                    if m.name == "__manifest__.json":
+                        man = set(json.loads(t.extractfile(m).read()))
+                    else:
+                        members.append(m)
+                t.extractall("/", members=members, filter="tar")
+            if man is not None:  # удалённые Claude файлы удаляем и здесь
+                for rel in self.sent_ws - man:
+                    try:
+                        os.remove(os.path.join(WS, rel))
+                    except OSError:
+                        pass
+        except Exception as e:
+            print("remote apply:", e, flush=True)
+
+    def stop(self):
+        try:
+            requests.post(f"{self.url}/relay/{self.job}/stop", headers=self.hdr, timeout=20)
+        except Exception:
+            pass
+
+
 def oom_first():
     """В дочернем процессе: при нехватке памяти ядро убьёт его, а не бота (повышать можно без root)."""
     try:
@@ -525,7 +709,7 @@ def group_cpu(pgid):
 def cpu_throttle(proc, run):
     """Wispbyte гасит сервер за высокую нагрузку на CPU. Пока Claude работает, держим его группу
     процессов в пределах CPU_LIMIT: если превысил — ненадолго замораживаем (SIGSTOP/SIGCONT)."""
-    if CPU_LIMIT <= 0:
+    if CPU_LIMIT <= 0 or isinstance(proc, RemoteProc):
         return
     last_t, last_c = time.time(), group_cpu(proc.pid)
     while proc.poll() is None and not run.get("stopped"):
@@ -547,6 +731,8 @@ def cpu_throttle(proc, run):
 
 def kill_run(proc):
     """Остановить Claude и всё, что он запустил (вся группа процессов)."""
+    if isinstance(proc, RemoteProc):
+        return proc.stop()
     try:
         os.killpg(proc.pid, 15)
         os.killpg(proc.pid, 18)  # разморозить, если стоял на паузе ограничителя CPU
@@ -839,6 +1025,7 @@ def status_text(chat):
             f"Провайдер: <code>{html.escape(cfg['provider'])}</code> · модель <code>{html.escape(cfg['model'])}</code>\n"
             f"Effort: {cfg.get('effort') or 'авто'} · режим: {MODES.get(cfg['mode'])}\n"
             f"Сессия: <code>{s[:8] if s else 'новая'}</code> · задача: {'идёт' if runs else 'нет'}\n"
+            f"Где работает Claude: {'GitHub Actions' if remote_on() else 'здесь (Wispbyte)'}\n"
             f"ECC: {len(ecc_cmds)} команд, навыки {'вкл' if cfg.get('ecc_skills') else 'выкл'}\n"
             f"Диск: свободно {du.free // 2**20} МБ из {du.total // 2**20} МБ" + (f"\nПамять: {mem}" if mem else ""))
 
@@ -918,6 +1105,14 @@ def handle_command(chat, text):
         tg("sendMessage", chat_id=chat, text="⏹ Останавливаю." if runs else "Сейчас ничего не выполняется.")
     elif key == "status":
         tg("sendMessage", chat_id=chat, text=status_text(chat), parse_mode="HTML")
+    elif key == "where":
+        if arg in ("github", "gh", "here", "local", "здесь"):
+            cfg["where"] = "github" if arg in ("github", "gh") else "local"; save_cfg()
+        elif not GH_TOKEN:
+            cfg["where"] = "local"
+        tg("sendMessage", chat_id=chat, text=("☁️ Claude работает на GitHub Actions (4 ядра, 16 ГБ). /where here — здесь"
+                                              if remote_on() else "🏠 Claude работает здесь, на Wispbyte. "
+                                              + ("/where github — на GitHub" if GH_TOKEN else "Для GitHub нужен GH_TOKEN в .env")))
     elif key == "files":
         paths = sorted(fs.idx.get("files", {}).keys()) or \
             sorted(os.path.relpath(os.path.join(d, f), WS) for d, _, fs_ in os.walk(WS) for f in fs_)
