@@ -333,6 +333,7 @@ def on_my_chat_member(u):
 
 def ensure_claude():
     global CLAUDE
+    os.chmod(os.path.join(HERE, "rexec"), 0o755)
     local = os.path.expanduser("~/.local/bin/claude")
     if subprocess.run(["sh", "-c", f"command -v {CLAUDE}"], capture_output=True).returncode == 0:
         return
