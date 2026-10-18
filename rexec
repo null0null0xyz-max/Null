@@ -1,0 +1,56 @@
+#!/usr/bin/env python3
+"""rexec "команда" — выполнить команду на Render с текущей рабочей папкой.
+Claude Code вызывает это через Bash. Изменённые на Render файлы возвращаются сюда.
+Env: REXEC_URL, REXEC_TOKEN, WORKSPACE.
+"""
+import os, io, sys, json, time, base64, tarfile, urllib.request, urllib.error
+
+URL, TOKEN = os.environ["REXEC_URL"].rstrip("/"), os.environ["REXEC_TOKEN"]
+WS = os.path.abspath(os.environ.get("WORKSPACE", "workspace"))
+SKIP = {".git", "node_modules", "__pycache__", ".venv", "venv", ".cache", ".claude"}
+
+if len(sys.argv) < 2:
+    sys.exit('usage: rexec "команда" [таймаут_сек]')
+cmd = sys.argv[1]
+timeout = int(sys.argv[2]) if len(sys.argv) > 2 else 600
+cwd = os.path.relpath(os.getcwd(), WS)
+cwd = "" if cwd.startswith("..") or cwd == "." else cwd
+
+buf = io.BytesIO()
+with tarfile.open(fileobj=buf, mode="w:gz") as t:
+    for root, dirs, files in os.walk(WS):
+        dirs[:] = [d for d in dirs if d not in SKIP]
+        for n in files:
+            p = os.path.join(root, n)
+            t.add(p, arcname=os.path.relpath(p, WS))
+body = json.dumps({"cmd": cmd, "cwd": cwd, "timeout": timeout,
+                   "tar": base64.b64encode(buf.getvalue()).decode()}).encode()
+
+
+def post():
+    req = urllib.request.Request(URL + "/exec", data=body, method="POST",
+                                 headers={"X-Token": TOKEN, "Content-Type": "application/json"})
+    return json.loads(urllib.request.urlopen(req, timeout=timeout + 60).read())
+
+
+for attempt in range(8):  # Render free спит: первый запрос может ждать ~1 минуту
+    try:
+        res = post()
+        break
+    except (urllib.error.URLError, TimeoutError) as e:
+        if getattr(e, "code", 0) == 401:
+            sys.exit("rexec: неверный REXEC_TOKEN")
+        print(f"[rexec] Render просыпается… ({attempt + 1})", file=sys.stderr)
+        time.sleep(10)
+else:
+    sys.exit("rexec: Render не ответил")
+
+if res.get("tar"):
+    with tarfile.open(fileobj=io.BytesIO(base64.b64decode(res["tar"])), mode="r:gz") as t:
+        try:
+            t.extractall(WS, filter="data")
+        except TypeError:
+            t.extractall(WS)
+sys.stdout.write(res.get("stdout", ""))
+sys.stderr.write(res.get("stderr", ""))
+sys.exit(res.get("code", 1))
