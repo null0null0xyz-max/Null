@@ -12,6 +12,7 @@ from dotenv_min import load_env; load_env()
 import os, re, io, json, glob, time, html, queue, base64, shutil, secrets, tarfile, mimetypes, threading, subprocess, itertools, requests
 import importlib.machinery, importlib.util
 from tgfs import TgFS
+import fast
 
 
 def _load_tgctl():
@@ -51,7 +52,7 @@ BUILTIN = [("menu", "Модель, провайдеры, effort, режим"), (
            ("compact", "Сжать контекст сессии"), ("context", "Сколько занято контекста"),
            ("init", "Создать CLAUDE.md для проекта"),
            ("review", "Ревью кода"), ("security_review", "Проверка безопасности"),
-           ("stop", "Остановить задачу"), ("where", "Где работает Claude: GitHub или здесь"), ("status", "Состояние бота и сервера"),
+           ("stop", "Остановить задачу"), ("fast", "Быстрые ответы: вкл/выкл"), ("where", "Где работает Claude: GitHub или здесь"), ("status", "Состояние бота и сервера"),
            ("files", "Файлы проекта"), ("usage", "Кредиты, токены, остаток"),
            ("agents", "Чаты агентов последней задачи"), ("skills", "Навыки"),
            ("repair", "Восстановить оглавление и index в канале"),
@@ -135,6 +136,7 @@ def delete_session(chat, sid):
 
 def clear_chat(chat):
     """Удалить сообщения чата (за 48 ч, что успел записать бот) и текущую сессию."""
+    fast.clear_hist(HERE, chat)
     p = os.path.join(tgctl.LOG_DIR, f"{chat}.jsonl")
     ids = []
     if os.path.exists(p):
@@ -731,6 +733,8 @@ def cpu_throttle(proc, run):
 
 def kill_run(proc):
     """Остановить Claude и всё, что он запустил (вся группа процессов)."""
+    if proc is None:  # быстрый режим останавливается по флагу stopped
+        return
     if isinstance(proc, RemoteProc):
         return proc.stop()
     try:
@@ -992,13 +996,81 @@ HELP = """<b>Как пользоваться</b>
 Любую команду ECC можно писать и через дефис: /code-review"""
 
 
+def fast_ok(prompt):
+    """Быстрый режим: обычные сообщения. Команды Claude Code и присланные файлы — сразу в Claude Code."""
+    return cfg.get("speed", "auto") == "auto" and not prompt.startswith("/") and "Приложены файлы" not in prompt
+
+
+def fast_system(chat, guest, who, mid):
+    ch = C(chat)
+    where = "личный чат с владельцем" if int(chat) > 0 else f"{ch['type']} «{ch['title']}»"
+    h = [f"Ты — Telegram-бот @{BOT_USERNAME}, быстрый режим. Чат: {where}. Пишет: {who}. "
+         "Отвечай сразу, кратко и по делу, по-русски, если пользователь не пишет на другом языке. "
+         "Ответ уходит rich-сообщением в Markdown (GFM): заголовки, таблицы, код, формулы $x^2$, ||спойлер||.",
+         "Для фактов из интернета используй web_fetch (поиск: https://html.duckduckgo.com/html/?q=...)."]
+    if not guest:
+        h.append("bash выполняет команды на сервере Render (Linux, есть интернет) — для быстрых проверок и расчётов. "
+                 "Если просят написать, создать или изменить код, файлы, сайт, проект, если задача большая, "
+                 "многошаговая или нужна сборка — НЕ делай сам, сразу вызови claude_code с полной задачей.")
+    p = chat_prompt(chat)
+    if p:
+        h.append("Инструкции владельца для этого чата: " + p)
+    return "\n".join(h)
+
+
+def run_fast(chat_id, prompt, guest=False, who="владелец", mid=None):
+    did = next(draft_ids)
+    started = time.time()
+    private = int(chat_id) > 0
+    st = {"text": "", "steps": [], "dirty": True, "done": False}
+    runs[did] = {"proc": None, "stopped": False, "chat": chat_id}
+    p = cfg["providers"][cfg["provider"]]
+    model = cfg.get("fast_model") or cfg["model"]
+
+    def drafter():
+        last = 0
+        while not st["done"] and not runs[did]["stopped"]:
+            if not private:
+                tg("sendChatAction", chat_id=chat_id, action="typing"); time.sleep(4); continue
+            if (st["dirty"] and time.time() - last > 1.0) or time.time() - last > 3:
+                st["dirty"], last = False, time.time()
+                head = "⚡ " + (st["steps"][-1] if st["steps"] else "Отвечаю…")
+                tg("sendRichMessageDraft", chat_id=chat_id, draft_id=did, can_stop=True,
+                   rich_message={"markdown": f"<tg-thinking>{html.escape(head)}</tg-thinking>\n\n" + safe_tail(st["text"])})
+            time.sleep(0.3)
+
+    ui = {"text": lambda d: (st.__setitem__("text", st["text"] + d), st.__setitem__("dirty", True)),
+          "step": lambda l: (st["steps"].append(l), st.__setitem__("dirty", True)),
+          "new_text": lambda: st.__setitem__("text", "")}
+    threading.Thread(target=drafter, daemon=True).start()
+    try:
+        res = fast.answer(HERE, chat_id, prompt, p.get("base_url"), p.get("token", ""), model,
+                          fast_system(chat_id, guest, who, mid), os.environ.get("REXEC_URL", ""),
+                          os.environ.get("REXEC_TOKEN", ""), ui, lambda: runs[did]["stopped"], guest)
+    except Exception as e:
+        res = {"text": "", "error": str(e), "delegate": None, "steps": [], "in": 0, "out": 0}
+    st["done"] = True
+    stopped = runs.pop(did)["stopped"]
+    if res.get("error") and not stopped:  # быстрый путь не сработал — отдаём задачу Claude Code
+        res["delegate"] = prompt
+    if res["delegate"] and not stopped:
+        return run_claude(chat_id, res["delegate"] if res["delegate"] != prompt else prompt, guest, who, mid)
+    sec = round(time.time() - started, 1)
+    body = "⏹ Остановлено." if stopped and not res["text"] else (res["text"] or "(пустой ответ)")
+    blocks = details(f"⚙️ Шаги · {len(res['steps'])}", "\n".join(f"{i + 1}. {md_esc(x)}" for i, x in
+                                                          enumerate(res["steps"]))) + "\n\n" if res["steps"] else ""
+    footer = f"<footer>⚡ {sec} с  •  🔤 {fmt_k(res['in'])} → {fmt_k(res['out'])}  •  {html.escape(model)}</footer>"
+    tgctl.rich_send(chat_id, blocks + body + "\n\n" + footer, WS, reply_to=None if private else mid)
+
+
 def start_task(chat, prompt, guest=False, who="владелец", mid=None):
     if not CHANNEL:
         return tg("sendMessage", chat_id=chat, text="Сначала добавь меня админом в канал для файлов.")
     if runs:
         return tg("sendMessage", chat_id=chat, text="Ещё работаю над прошлой задачей — подожди или /stop.",
                   **({"reply_parameters": {"message_id": mid, "allow_sending_without_reply": True}} if mid else {}))
-    threading.Thread(target=run_claude, args=(chat, prompt, guest, who, mid), daemon=True).start()
+    target = run_fast if fast_ok(prompt) else run_claude
+    threading.Thread(target=target, args=(chat, prompt, guest, who, mid), daemon=True).start()
 
 
 def send_long(chat, text, **kw):
@@ -1058,7 +1130,19 @@ def handle_command(chat, text):
         tg("sendMessage", chat_id=chat, text=t, parse_mode="HTML", reply_markup=m)
     elif key == "help":
         tg("sendMessage", chat_id=chat, text=HELP, parse_mode="HTML")
+    elif key == "fast":
+        if arg.startswith("model"):
+            cfg["fast_model"] = arg[5:].strip(); save_cfg()
+        elif arg in ("on", "off", "вкл", "выкл"):
+            cfg["speed"] = "auto" if arg in ("on", "вкл") else "full"; save_cfg()
+        elif not arg:
+            cfg["speed"] = "full" if cfg.get("speed", "auto") == "auto" else "auto"; save_cfg()
+        tg("sendMessage", chat_id=chat, text=("⚡ Быстрые ответы ВКЛ: обычные сообщения — сразу, сложные задачи "
+                                              "сами уходят в Claude Code. Модель: " + (cfg.get("fast_model") or cfg["model"])
+                                              + ". /fast model ИМЯ — сменить, /fast off — всё через Claude Code")
+           if cfg.get("speed", "auto") == "auto" else "🐢 Быстрые ответы ВЫКЛ: всё идёт в Claude Code. /fast on — включить")
     elif key == "new":
+        fast.clear_hist(HERE, chat)
         C(chat)["session"] = None; save_cfg()
         tg("sendMessage", chat_id=chat, text="🆕 Новая сессия")
     elif key == "clear":
