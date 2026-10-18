@@ -1,0 +1,157 @@
+#!/usr/bin/env python3
+"""tgctl — управление текущим Telegram-чатом из Claude Code (через Bash).
+
+  tgctl history [N]            последние N сообщений чата (id, автор, текст)
+  tgctl send "markdown"        отправить rich-сообщение (заголовки, таблицы, код, формулы,
+                               картинки ![подпись](file:путь.png))
+  tgctl photo ПУТЬ [подпись]   отправить картинку      tgctl file ПУТЬ [подпись]  — файл
+  tgctl pin ID | unpin ID|all  закрепить / открепить
+  tgctl delete ID [ID ...]     удалить сообщения
+  tgctl edit ID "текст"        изменить сообщение бота
+  tgctl react ID 👍            поставить реакцию
+  tgctl prompt ["текст"]       показать / задать постоянные инструкции для этого чата
+  tgctl api МЕТОД '{json}'     любой метод Bot API (chat_id подставится сам)
+
+Канал-хранилище файлов трогать нельзя: туда можно только отправлять файлы (это делает сам бот).
+"""
+import os, re, sys, json, time, mimetypes
+import requests
+
+TOKEN = os.environ.get("BOT_TOKEN", "")
+API = f"https://api.telegram.org/bot{TOKEN}/"
+HERE = os.path.dirname(os.path.abspath(__file__))
+LOG_DIR = os.path.join(HERE, "chatlog")
+PROMPT_DIR = os.path.join(HERE, "chat_prompts")
+STORAGE_OK = {"sendDocument", "getChat", "getFile"}
+
+
+def log_msg(chat, mid, who, text):
+    os.makedirs(LOG_DIR, exist_ok=True)
+    with open(os.path.join(LOG_DIR, f"{chat}.jsonl"), "a", encoding="utf-8") as f:
+        f.write(json.dumps({"id": mid, "from": who, "text": (text or "")[:2000], "ts": int(time.time())},
+                           ensure_ascii=False) + "\n")
+
+
+def call(method, files=None, **data):
+    storage = os.environ.get("TG_STORAGE", "")
+    if storage and str(data.get("chat_id")) == storage and method not in STORAGE_OK:
+        raise SystemExit("Канал-хранилище трогать нельзя — только файлы, их синхронизирует бот.")
+    if files:
+        data = {k: (json.dumps(v) if isinstance(v, (dict, list)) else v) for k, v in data.items()}
+        r = requests.post(API + method, data=data, files=files, timeout=120).json()
+    else:
+        r = requests.post(API + method, json=data, timeout=60).json()
+    res = r.get("result")
+    if r.get("ok") and isinstance(res, dict) and res.get("message_id") and method.startswith("send") \
+            and method != "sendRichMessage":
+        log_msg(data.get("chat_id"), res["message_id"], "bot",
+                data.get("text") or data.get("caption") or "[" + method[4:] + "]")
+    return r
+
+
+MEDIA_RE = re.compile(r'!\[([^\]]*)\]\((?:file:)?([^)\s"]+)(\s+"[^"]*")?\)')
+
+
+def kind_of(path):
+    ext = os.path.splitext(path)[1].lower()
+    if ext in (".png", ".jpg", ".jpeg", ".webp"):
+        return "photo", "photo"
+    if ext == ".gif":
+        return "animation", "video"
+    if ext in (".mp4", ".mov", ".webm"):
+        return "video", "video"
+    if ext in (".mp3", ".m4a", ".wav", ".flac"):
+        return "audio", "audio"
+    if ext in (".ogg", ".oga", ".opus"):
+        return "voice_note", "audio"
+    return "document", "document"
+
+
+def rich_send(chat, md, base, reply_to=None, files_sent=None):
+    """Rich-сообщение (Markdown). Локальные файлы ![..](file:путь) загружаются как медиа."""
+    media, files = [], {}
+
+    def repl(m):
+        path = m.group(2)
+        if path.startswith(("http://", "https://", "tg://")):
+            return m.group(0)
+        full = path if os.path.isabs(path) else os.path.join(base, path)
+        if not os.path.isfile(full) or len(media) >= 50:
+            return m.group(0)
+        mid = f"f{len(media) + 1}"
+        itype, link = kind_of(full)
+        media.append({"id": mid, "media": {"type": itype, "media": "attach://" + mid}})
+        files[mid] = (os.path.basename(full), open(full, "rb"))
+        return f"![{m.group(1)}](tg://{link}?id={mid}{m.group(3) or ''})"
+
+    body = MEDIA_RE.sub(repl, md)
+    rm = {"markdown": body}
+    if media:
+        rm["media"] = media
+    extra = {"reply_parameters": {"message_id": reply_to, "allow_sending_without_reply": True}} if reply_to else {}
+    r = call("sendRichMessage", files=files or None, chat_id=chat, rich_message=rm, **extra)
+    if r.get("ok"):
+        log_msg(chat, r["result"]["message_id"], "bot", md)
+        return r
+    # запасной путь: простой текст + файлы отдельно
+    plain = re.sub(r"<[^>]+>", "", MEDIA_RE.sub("", md)).strip() or "📎"
+    for i in range(0, len(plain), 4000):
+        r2 = call("sendMessage", chat_id=chat, text=plain[i:i + 4000], **extra)
+    for name, fh in files.values():
+        fh.seek(0)
+        call("sendDocument", chat_id=chat, files={"document": (name, fh)})
+    return r2 if plain else r
+
+
+def main(argv):
+    chat = os.environ.get("TG_CHAT")
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(__doc__); return
+    cmd, args = argv[0], argv[1:]
+    out = None
+    if cmd == "history":
+        n = int(args[0]) if args else 30
+        p = os.path.join(LOG_DIR, f"{chat}.jsonl")
+        lines = open(p, encoding="utf-8").read().splitlines()[-n:] if os.path.exists(p) else []
+        for l in lines:
+            e = json.loads(l)
+            print(f"[{e['id']}] {e['from']} ({time.strftime('%d.%m %H:%M', time.localtime(e['ts']))}): {e['text']}")
+        return
+    if cmd == "send":
+        out = rich_send(chat, " ".join(args), os.getcwd())
+    elif cmd in ("photo", "file"):
+        path, cap = args[0], " ".join(args[1:])
+        m = "sendPhoto" if cmd == "photo" else "sendDocument"
+        out = call(m, chat_id=chat, caption=cap, files={"photo" if cmd == "photo" else "document": open(path, "rb")})
+    elif cmd == "pin":
+        out = call("pinChatMessage", chat_id=chat, message_id=int(args[0]), disable_notification=True)
+    elif cmd == "unpin":
+        out = call("unpinAllChatMessages", chat_id=chat) if args and args[0] == "all" else \
+            call("unpinChatMessage", chat_id=chat, **({"message_id": int(args[0])} if args else {}))
+    elif cmd == "delete":
+        out = call("deleteMessages", chat_id=chat, message_ids=[int(x) for x in args])
+    elif cmd == "edit":
+        out = call("editMessageText", chat_id=chat, message_id=int(args[0]), text=" ".join(args[1:]))
+    elif cmd == "react":
+        out = call("setMessageReaction", chat_id=chat, message_id=int(args[0]),
+                   reaction=[{"type": "emoji", "emoji": args[1] if len(args) > 1 else "👍"}])
+    elif cmd == "prompt":
+        os.makedirs(PROMPT_DIR, exist_ok=True)
+        p = os.path.join(PROMPT_DIR, f"{chat}.txt")
+        if args:
+            open(p, "w", encoding="utf-8").write(" ".join(args))
+            print("Инструкции чата сохранены.")
+        else:
+            print(open(p, encoding="utf-8").read() if os.path.exists(p) else "(нет)")
+        return
+    elif cmd == "api":
+        data = json.loads(args[1]) if len(args) > 1 else {}
+        data.setdefault("chat_id", chat)
+        out = call(args[0], **data)
+    else:
+        print(__doc__); sys.exit(1)
+    print(json.dumps(out, ensure_ascii=False)[:1500])
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])
