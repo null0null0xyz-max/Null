@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""rexec "команда" — выполнить команду на Render с текущей рабочей папкой.
+"""rexec "команда" — выполнить bash-команду на Render с текущей рабочей папкой.
+rexec publish     — выложить папку sites/ и показать публичные ссылки на сайты.
 Claude Code вызывает это через Bash. Изменённые на Render файлы возвращаются сюда.
 Env: REXEC_URL, REXEC_TOKEN, WORKSPACE.
 """
@@ -12,6 +13,12 @@ SKIP = {".git", "node_modules", "__pycache__", ".venv", "venv", ".cache", ".clau
 if len(sys.argv) < 2:
     sys.exit('usage: rexec "команда" [таймаут_сек]')
 cmd = sys.argv[1]
+publish = cmd == "publish"
+if publish:
+    cmd = "true"
+publish = cmd == "publish"
+if publish:
+    cmd = "true"
 timeout = int(sys.argv[2]) if len(sys.argv) > 2 else 600
 cwd = os.path.relpath(os.getcwd(), WS)
 cwd = "" if cwd.startswith("..") or cwd == "." else cwd
@@ -52,5 +59,13 @@ if res.get("tar"):
         except TypeError:
             t.extractall(WS)
 sys.stdout.write(res.get("stdout", ""))
+if publish:
+    sd = os.path.join(WS, "sites")
+    names = sorted(n for n in os.listdir(sd) if os.path.isdir(os.path.join(sd, n))) if os.path.isdir(sd) else []
+    print("\n".join(f"{URL}/s/{n}/" for n in names) or "Нет папок в sites/ — создай sites/<имя>/index.html")
+if publish:
+    sd = os.path.join(WS, "sites")
+    names = sorted(n for n in os.listdir(sd) if os.path.isdir(os.path.join(sd, n))) if os.path.isdir(sd) else []
+    print("\n".join(f"{URL}/s/{n}/" for n in names) or "Нет папок в sites/ — создай sites/<имя>/index.html")
 sys.stderr.write(res.get("stderr", ""))
 sys.exit(res.get("code", 1))
