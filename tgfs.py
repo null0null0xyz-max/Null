@@ -99,11 +99,15 @@ class TgFS:
         meta = self.idx["files"].get(path)
         if meta and meta["sha"] == sha(data):
             return
+        msg, gone = None, not meta
         if meta:  # editMessageMedia сохраняет message_id -> ссылки не ломаются
-            msg = self.call("editMessageMedia", chat_id=self.cid, message_id=meta["mid"],
-                            media={"type": "document", "media": "attach://f", "caption": path},
-                            files={"f": (name, data)})
-        else:
+            try:
+                msg = self.call("editMessageMedia", chat_id=self.cid, message_id=meta["mid"],
+                                media={"type": "document", "media": "attach://f", "caption": path},
+                                files={"f": (name, data)})
+            except RuntimeError:
+                gone = True  # сообщение удалили руками — пришлём заново
+        if gone:
             msg = self.call("sendDocument", chat_id=self.cid, caption=path,
                             disable_notification=True, files={"document": (name, data)})
         self.idx["files"][path] = {"mid": msg["message_id"], "fid": msg["document"]["file_id"], "sha": sha(data)}
@@ -209,18 +213,32 @@ class TgFS:
     def _edit_dir(self, d, text):
         if self.idx["dir_text"].get(d) == text:
             return
-        self.call("editMessageText", chat_id=self.cid, message_id=self.idx["dirs"][d], text=text,
-                  parse_mode="HTML", link_preview_options={"is_disabled": True})
+        try:
+            self.call("editMessageText", chat_id=self.cid, message_id=self.idx["dirs"][d], text=text,
+                      parse_mode="HTML", link_preview_options={"is_disabled": True})
+        except RuntimeError:  # оглавление удалили — создаём заново
+            m = self.call("sendMessage", chat_id=self.cid, text=text, parse_mode="HTML",
+                          disable_notification=True, link_preview_options={"is_disabled": True})
+            self.idx["dirs"][d] = m["message_id"]
+            if d == "":
+                self.call("pinChatMessage", chat_id=self.cid, message_id=m["message_id"], disable_notification=True)
         self.idx["dir_text"][d] = text
 
     def _upload_index(self):
         data = json.dumps(self.idx).encode()
+        msg, gone = None, not self.idx.get("index_mid")
         if self.idx.get("index_mid"):
-            msg = self.call("editMessageMedia", chat_id=self.cid, message_id=self.idx["index_mid"],
-                            media={"type": "document", "media": "attach://f", "caption": "⚙️ index"},
-                            files={"f": ("index.json", data)})
-        else:
+            try:
+                msg = self.call("editMessageMedia", chat_id=self.cid, message_id=self.idx["index_mid"],
+                                media={"type": "document", "media": "attach://f", "caption": "⚙️ index"},
+                                files={"f": ("index.json", data)})
+            except RuntimeError:
+                gone = True  # index.json удалили — отправим новый
+        if gone:
             msg = self.call("sendDocument", chat_id=self.cid, caption="⚙️ index", disable_notification=True,
                             files={"document": ("index.json", data)})
             self.idx["index_mid"] = msg["message_id"]
-        return msg["document"]["file_id"]
+        if not isinstance(msg, dict):  # «not modified» — файл тот же
+            return self.idx.get("index_fid")
+        self.idx["index_fid"] = msg["document"]["file_id"]
+        return self.idx["index_fid"]
