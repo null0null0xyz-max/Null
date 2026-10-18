@@ -36,7 +36,7 @@ DEFAULT_CFG = {
     "provider": "anthropic", "model": "sonnet", "chats": {},
     "effort": "", "mode": "bypass", "ecc_skills": True,
 }
-EFFORTS = ["low", "medium", "high", "xhigh", "max"]
+EFFORTS = ["low", "medium", "high", "xhigh", "max", "ultrathink"]
 MODES = {"bypass": "🚀 Всё разрешено", "plan": "📋 План (только чтение)", "acceptEdits": "✏️ Правки без Bash"}
 CLAUDE_DIR = os.path.expanduser("~/.claude")
 ECC_URL = "https://codeload.github.com/affaan-m/ECC/tar.gz/refs/heads/main"
@@ -255,6 +255,20 @@ def system_hint(chat, guest, who, mid):
         h += ["Рабочая папка проекта — текущая директория, файлы читай и правь здесь; можно создавать и удалять "
               "файлы и папки — изменения сами уйдут в канал-хранилище. Тяжёлые команды (установка пакетов, запуск, "
               'тесты, сборка) выполняй через Bash: rexec "команда" — на удалённой машине с копией папки.',
+              "Сайты и веб-приложения НЕ запускай на этой машине и не поднимай туннели (cloudflared, ngrok) и не "
+              "давай IP-адреса. Статический сайт: положи в sites/<имя>/ (index.html и файлы) и выполни "
+              f"rexec publish — ссылка будет {os.environ.get('REXEC_URL', '').rstrip('/')}/s/<имя>/ . "
+              "Сервер с бэкендом: запусти в фоне на Render, например "
+              'rexec "cd sites/app && nohup python3 -m http.server 8000 > app.log 2>&1 &", порт 3000–9999 — '
+              f"ссылка {os.environ.get('REXEC_URL', '').rstrip('/')}/p/8000/ (пути в приложении делай относительными). "
+              "Render — это Linux с bash; rexec выполняет команду в bash. Он может уснуть — тогда просто снова rexec publish.",
+              "Сайты и веб-приложения НЕ запускай на этой машине и не поднимай туннели (cloudflared, ngrok) и не "
+              "давай IP-адреса. Статический сайт: положи в sites/<имя>/ (index.html и файлы) и выполни "
+              f"rexec publish — ссылка будет {os.environ.get('REXEC_URL', '').rstrip('/')}/s/<имя>/ . "
+              "Сервер с бэкендом: запусти в фоне на Render, например "
+              'rexec "cd sites/app && nohup python3 -m http.server 8000 > app.log 2>&1 &", порт 3000–9999 — '
+              f"ссылка {os.environ.get('REXEC_URL', '').rstrip('/')}/p/8000/ (пути в приложении делай относительными). "
+              "Render — это Linux с bash; rexec выполняет команду в bash. Он может уснуть — тогда просто снова rexec publish.",
               "Графики и картинки: построй PNG (например matplotlib через rexec или локально) в папке проекта "
               "и вставь в ответ строкой ![подпись](file:путь/к/файлу.png) — он прикрепится к сообщению.",
               "Чатом управляешь через Bash-команду tgctl: tgctl history 30 (последние сообщения с id), "
@@ -291,7 +305,10 @@ def run_claude(chat_id, prompt, guest=False, who="владелец", mid=None):
                 "--disallowedTools", "Bash Edit Write MultiEdit NotebookEdit Read Grep Glob Task Agent"]
     else:
         cmd += ["--dangerously-skip-permissions"] if mode == "bypass" else ["--permission-mode", mode]
-    if cfg.get("effort"):
+    if cfg.get("effort") == "ultrathink":  # максимум размышлений: effort max + ключевое слово ultrathink
+        cmd += ["--effort", "max"]
+        cmd[2] = "ultrathink. " + cmd[2]
+    elif cfg.get("effort"):
         cmd += ["--effort", cfg["effort"]]
     new_session = not ch["session"]
     if ch["session"]:
@@ -299,8 +316,8 @@ def run_claude(chat_id, prompt, guest=False, who="владелец", mid=None):
     env = claude_env()
     env.update(TG_CHAT=str(chat_id), TG_MSG=str(mid or ""), TG_STORAGE=str(CHANNEL))
     try:
-        proc = subprocess.Popen(cmd, cwd=WS, env=env, stdout=subprocess.PIPE,
-                                stderr=subprocess.STDOUT, text=True, bufsize=1)
+        proc = subprocess.Popen(cmd, cwd=WS, env=env, stdout=subprocess.PIPE, stdin=subprocess.DEVNULL,
+                                stderr=subprocess.STDOUT, text=True, bufsize=1, start_new_session=True)
     except FileNotFoundError:
         tg("sendMessage", chat_id=chat_id, text=f"Не найден {CLAUDE}. Проверь CLAUDE_BIN.")
         return
@@ -314,17 +331,17 @@ def run_claude(chat_id, prompt, guest=False, who="владелец", mid=None):
         if st["thinking"] and not st["text"]:
             lines.append(st["thinking"][-300:])
         status = "<br>".join(html.escape(x) for x in lines)
-        return f"<tg-thinking>{status}</tg-thinking>\n\n" + st["text"][-6000:]
+        return f"<tg-thinking>{status}</tg-thinking>\n\n" + safe_tail(st["text"])
 
     def drafter():
         # Плавное появление: частые обновления, пока идёт текст; не реже раза в 3 с (черновик живёт 30 с)
         last = 0
-        while proc.poll() is None and not runs[did]["stopped"]:
+        while proc.poll() is None and not runs[did]["stopped"] and not st.get("done"):
             if not private:
                 tg("sendChatAction", chat_id=chat_id, action="typing")
                 time.sleep(4)
                 continue
-            if st["dirty"] or time.time() - last > 3:
+            if (st["dirty"] and time.time() - last > 1.5) or time.time() - last > 3:
                 st["dirty"] = False
                 last = time.time()
                 r = tg("sendRichMessageDraft", chat_id=chat_id, draft_id=did, can_stop=True,
@@ -333,7 +350,7 @@ def run_claude(chat_id, prompt, guest=False, who="владелец", mid=None):
                     tg("sendRichMessageDraft", chat_id=chat_id, draft_id=did, can_stop=True,
                        rich_message={"html": "<tg-thinking>" + html.escape(st["steps"][-1] if st["steps"] else "Думаю…")
                                      + "</tg-thinking>"})
-            time.sleep(0.7)
+            time.sleep(0.5)
 
     threading.Thread(target=drafter, daemon=True).start()
     errlines = []
@@ -392,7 +409,18 @@ def run_claude(chat_id, prompt, guest=False, who="владелец", mid=None):
                 save_cfg()
             if ev.get("is_error"):
                 st["error"] = ev.get("subtype", "error")
-    proc.wait()
+            # Ответ готов. Дальше не ждём: фоновые процессы (сервер, туннель), запущенные моделью,
+            # держат stdout открытым — из-за этого задача «не заканчивалась».
+            st["done"] = True
+            break
+    try:
+        proc.wait(timeout=15)
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        proc.stdout.close()
+    except Exception:
+        pass
     err = "".join(errlines)[-1500:]
     stopped = runs.pop(did)["stopped"]
     last_agents.clear()
@@ -451,6 +479,28 @@ def run_claude(chat_id, prompt, guest=False, who="владелец", mid=None):
         tgctl.rich_send(chat_id, md, WS, reply_to=None if private else mid)
     if user_cmds_changed():
         register_commands()
+
+
+def kill_run(proc):
+    """Остановить Claude и всё, что он запустил (вся группа процессов)."""
+    try:
+        os.killpg(proc.pid, 15)
+    except Exception:
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+
+
+def safe_tail(text, n=3500):
+    """Хвост текста для черновика без «рваной» разметки: с границы абзаца, с закрытым ```."""
+    if len(text) > n:
+        cut = text.find("\n\n", len(text) - n)
+        text = "…\n\n" + text[cut + 2 if cut != -1 else len(text) - n:]
+    if text.count("```") % 2:
+        text += "\n```"
+    text = re.sub(r"<details[^>]*>(?![\s\S]*</details>)", "", text)
+    return text
 
 
 def md_esc(t):
@@ -720,18 +770,12 @@ def status_text(chat):
     except Exception:
         pass
     s = C(chat)["session"]
-    try:
-        r = resources()
-        mem = (f"CPU {r['cpu']:.0f}% · " if r["cpu"] is not None else "") + \
-            (f"RAM {r['mem']:.0f}% ({r['mem_mb']}/{r['mem_max']} МБ)" if r["mem"] is not None else mem)
-    except Exception:
-        pass
     return (f"🤖 Claude Code: <code>{html.escape(ver or '?')}</code>\n"
             f"Провайдер: <code>{html.escape(cfg['provider'])}</code> · модель <code>{html.escape(cfg['model'])}</code>\n"
             f"Effort: {cfg.get('effort') or 'авто'} · режим: {MODES.get(cfg['mode'])}\n"
             f"Сессия: <code>{s[:8] if s else 'новая'}</code> · задача: {'идёт' if runs else 'нет'}\n"
             f"ECC: {len(ecc_cmds)} команд, навыки {'вкл' if cfg.get('ecc_skills') else 'выкл'}\n"
-            f"Диск: свободно {du.free // 2**20} МБ из {du.total // 2**20} МБ" + (f"\nНагрузка: {mem}" if mem else ""))
+            f"Диск: свободно {du.free // 2**20} МБ из {du.total // 2**20} МБ" + (f"\nПамять: {mem}" if mem else ""))
 
 
 def usage_text():
@@ -805,7 +849,7 @@ def handle_command(chat, text):
     elif key == "stop":
         for r in runs.values():
             r["stopped"] = True
-            r["proc"].terminate()
+            kill_run(r["proc"])
         tg("sendMessage", chat_id=chat, text="⏹ Останавливаю." if runs else "Сейчас ничего не выполняется.")
     elif key == "status":
         tg("sendMessage", chat_id=chat, text=status_text(chat), parse_mode="HTML")
@@ -1152,112 +1196,16 @@ def ensure_claude():
         CLAUDE = local
 
 
-# ---------------- монитор ресурсов: CPU / RAM / диск > 80% -> сообщение владельцу ----------------
-ALERT_PCT = float(os.environ.get("ALERT_PCT", 80))
-
-
-def _read(p):
-    try:
-        return open(p).read().strip()
-    except OSError:
-        return ""
-
-
-def mem_pct():
-    cur = _read("/sys/fs/cgroup/memory.current") or _read("/sys/fs/cgroup/memory/memory.usage_in_bytes")
-    mx = _read("/sys/fs/cgroup/memory.max") or _read("/sys/fs/cgroup/memory/memory.limit_in_bytes")
-    if not cur or not mx or mx == "max" or int(mx) > 1 << 50:
-        return None, 0, 0
-    return int(cur) * 100 / int(mx), int(cur) >> 20, int(mx) >> 20
-
-
-def cpu_usage_usec():
-    for line in _read("/sys/fs/cgroup/cpu.stat").splitlines():
-        if line.startswith("usage_usec"):
-            return int(line.split()[1])
-    v = _read("/sys/fs/cgroup/cpuacct/cpuacct.usage")
-    return int(v) // 1000 if v else None
-
-
-def cpu_limit():
-    q = _read("/sys/fs/cgroup/cpu.max").split()
-    if len(q) == 2 and q[0] != "max":
-        return int(q[0]) / int(q[1])
-    q, p = _read("/sys/fs/cgroup/cpu/cpu.cfs_quota_us"), _read("/sys/fs/cgroup/cpu/cpu.cfs_period_us")
-    if q and p and int(q) > 0:
-        return int(q) / int(p)
-    return float(os.cpu_count() or 1)
-
-
-def top_procs():
-    try:
-        out = subprocess.run(["ps", "-eo", "rss,pcpu,comm", "--sort=-rss"], capture_output=True,
-                             text=True, timeout=10).stdout.splitlines()[1:6]
-        return "\n".join(f"{int(l.split()[0]) >> 10} МБ · {l.split()[1]}% · {l.split()[2]}" for l in out)
-    except Exception:
-        return ""
-
-
-def resources():
-    u1, t1 = cpu_usage_usec(), time.time()
-    time.sleep(5)
-    u2, t2 = cpu_usage_usec(), time.time()
-    cpu = (u2 - u1) / 1e6 / (t2 - t1) / cpu_limit() * 100 if u1 is not None and u2 is not None else None
-    mem, used, mx = mem_pct()
-    if mem is None and os.environ.get("SERVER_MEMORY"):  # Pterodactyl/Wispbyte отдаёт лимит в env
-        mx = int(os.environ["SERVER_MEMORY"])
-        used = int(subprocess.run(["sh", "-c", "ps -eo rss= | awk '{s+=$1} END {print s}'"],
-                                  capture_output=True, text=True).stdout.strip() or 0) >> 10
-        mem = used * 100 / mx if mx else None
-    dmb, dmax = disk_used()
-    return {"cpu": cpu, "mem": mem, "mem_mb": used, "mem_max": mx,
-            "disk": dmb * 100 / dmax, "disk_mb": dmb, "disk_max": dmax}
-
-
-_disk = {"t": 0, "v": 0}
-
-
-def disk_used():
-    """Занято в папке сервера (лимит Wispbyte — квота, df её не видит). Пересчёт раз в 5 мин."""
-    dmax = int(os.environ.get("DISK_LIMIT_MB") or os.environ.get("SERVER_DISK") or 1024) or 1024
-    if time.time() - _disk["t"] > 300:
-        total = 0
-        for root in {HERE, os.path.expanduser("~")}:
-            for d, _, files in os.walk(root):
-                for f in files:
-                    try:
-                        total += os.lstat(os.path.join(d, f)).st_size
-                    except OSError:
-                        pass
-        _disk.update(t=time.time(), v=total >> 20)
-    return _disk["v"], dmax
-
-
-def monitor():
-    last = {}
-    while True:
+def keep_render_awake():
+    """Render free засыпает через 15 мин без запросов и теряет /tmp — вместе с сайтами.
+    Один лёгкий GET раз в 10 минут держит его бодрым (это ~1 запрос, не нагрузка)."""
+    url = os.environ.get("REXEC_URL", "").rstrip("/")
+    while url:
         try:
-            r = resources()
-            hot = []
-            if r["cpu"] is not None and r["cpu"] >= ALERT_PCT:
-                hot.append(f"🔥 CPU: {r['cpu']:.0f}% от лимита")
-            if r["mem"] is not None and r["mem"] >= ALERT_PCT:
-                hot.append(f"🧠 RAM: {r['mem']:.0f}% ({r['mem_mb']} из {r['mem_max']} МБ)")
-            if r["disk"] >= ALERT_PCT:
-                hot.append(f"💾 Диск: {r['disk']:.0f}% ({r['disk_mb']} из {r['disk_max']} МБ)")
-            now = time.time()
-            fresh = [h for h in hot if now - last.get(h[:2], 0) > 1800]  # не чаще раза в 30 мин на ресурс
-            if fresh and OWNER:
-                for h in fresh:
-                    last[h[:2]] = now
-                tp = top_procs()
-                tg("sendMessage", chat_id=OWNER, parse_mode="HTML",
-                   text="⚠️ <b>Сервер нагружен</b>\n" + "\n".join(hot) +
-                   (f"\n\nБольше всего едят:\n<pre>{html.escape(tp)}</pre>" if tp else "") +
-                   ("\n\nИдёт задача — /stop, если надо остановить." if runs else ""))
-        except Exception as e:
-            print("monitor error:", e, flush=True)
-        time.sleep(25)
+            requests.get(url + "/", timeout=30)
+        except Exception:
+            pass
+        time.sleep(600)
 
 
 BOT_ID, BOT_USERNAME = 0, ""
@@ -1282,7 +1230,7 @@ def main():
     user_cmds_changed()
     register_commands()
     threading.Thread(target=lambda: (install_ecc(), register_commands()), daemon=True).start()
-    threading.Thread(target=monitor, daemon=True).start()
+    threading.Thread(target=keep_render_awake, daemon=True).start()
     print("bot started", flush=True)
     offset = 0
     while True:
@@ -1299,7 +1247,7 @@ def main():
                     r = runs.get(u["stopped_message_generation"].get("draft_id"))
                     if r:
                         r["stopped"] = True
-                        r["proc"].terminate()
+                        kill_run(r["proc"])
                 elif "my_chat_member" in u:
                     on_my_chat_member(u["my_chat_member"])
                 elif "callback_query" in u:
