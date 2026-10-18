@@ -322,20 +322,31 @@ def run_claude(chat_id, prompt, guest=False, who="владелец", mid=None):
     heap = os.environ.get("CLAUDE_HEAP_MB", "320")
     if "max-old-space-size" not in env.get("NODE_OPTIONS", ""):
         env["NODE_OPTIONS"] = (env.get("NODE_OPTIONS", "") + f" --max-old-space-size={heap}").strip()
+    runs[did] = {"proc": None, "stopped": False, "chat": chat_id}
     try:
         if remote_on():
+            if private:
+                tg("sendRichMessageDraft", chat_id=chat_id, draft_id=did, can_stop=True,
+                   rich_message={"markdown": "<tg-thinking>☁️ Отправляю задачу на GitHub…</tg-thinking>"})
             proc = RemoteProc(cmd, env, ch["session"])
+            if runs[did]["stopped"]:  # нажали стоп, пока отправляли
+                proc.stop()
+                runs.pop(did, None)
+                tg("sendMessage", chat_id=chat_id, text="⏹ Остановлено.")
+                return
         else:
             proc = subprocess.Popen(cmd, cwd=WS, env=env, stdout=subprocess.PIPE, stdin=subprocess.DEVNULL,
                                     stderr=subprocess.STDOUT, text=True, bufsize=1, start_new_session=True,
                                     preexec_fn=oom_first)
     except FileNotFoundError:
+        runs.pop(did, None)
         tg("sendMessage", chat_id=chat_id, text=f"Не найден {CLAUDE}. Проверь CLAUDE_BIN.")
         return
     except Exception as e:
+        runs.pop(did, None)
         tg("sendMessage", chat_id=chat_id, text=f"Не удалось запустить Claude: {e}")
         return
-    runs[did] = {"proc": proc, "stopped": False, "chat": chat_id}
+    runs[did]["proc"] = proc
 
     def draft_md():
         sec = int(time.time() - started)
@@ -542,6 +553,7 @@ class RemoteProc:
         self.q = queue.Queue()
         self.done = threading.Event()
         self.applied = False
+        self.stopped = False
         self.sent_ws = set()
         home = os.path.expanduser("~")
         payload = {"cmd": cmd, "home": home, "here": HERE, "ws": WS, "ecc_dir": ECC_DIR,
@@ -605,7 +617,7 @@ class RemoteProc:
 
     def _poll(self):
         n, t0, started = 0, time.time(), False
-        while True:
+        while not self.stopped:
             try:
                 j = requests.get(f"{self.url}/relay/{self.job}/ev", params={"from": n},
                                  headers=self.hdr, timeout=40).json()
@@ -633,6 +645,8 @@ class RemoteProc:
                 self.q.put("GitHub Actions не взял задачу за 5 минут.\n")
                 self.returncode = 1
                 break
+        if self.stopped:
+            return
         if self.returncode is None:
             self.returncode = 1
         self.done.set()
@@ -642,6 +656,8 @@ class RemoteProc:
         return self.returncode if self.done.is_set() else None
 
     def wait(self, timeout=None):
+        if self.stopped:
+            return self.returncode
         self.done.wait(max(timeout or 0, 240))  # файлы возвращаются после ответа
         self._apply()
         return self.returncode
@@ -673,10 +689,22 @@ class RemoteProc:
             print("remote apply:", e, flush=True)
 
     def stop(self):
-        try:
-            requests.post(f"{self.url}/relay/{self.job}/stop", headers=self.hdr, timeout=20)
-        except Exception:
-            pass
+        """Останавливаем сразу: бот свободен мгновенно, а машине GitHub стоп уходит фоном."""
+        if self.stopped:
+            return
+        self.stopped = True
+        self.returncode = -15
+        self.done.set()
+        self.q.put(None)
+
+        def bg():
+            for _ in range(3):
+                try:
+                    requests.post(f"{self.url}/relay/{self.job}/stop", headers=self.hdr, timeout=20)
+                    return
+                except Exception:
+                    time.sleep(3)
+        threading.Thread(target=bg, daemon=True).start()
 
 
 def oom_first():
@@ -1066,8 +1094,8 @@ def run_fast(chat_id, prompt, guest=False, who="владелец", mid=None):
 def start_task(chat, prompt, guest=False, who="владелец", mid=None):
     if not CHANNEL:
         return tg("sendMessage", chat_id=chat, text="Сначала добавь меня админом в канал для файлов.")
-    if runs:
-        return tg("sendMessage", chat_id=chat, text="Ещё работаю над прошлой задачей — подожди или /stop.",
+    if any(not r["stopped"] for r in runs.values()):  # остановленные уже не мешают
+        return tg("sendMessage", chat_id=chat, text="Ещё работаю над прошлой задачей — подожди или напиши «стоп».",
                   **({"reply_parameters": {"message_id": mid, "allow_sending_without_reply": True}} if mid else {}))
     target = run_fast if fast_ok(prompt) else run_claude
     threading.Thread(target=target, args=(chat, prompt, guest, who, mid), daemon=True).start()
@@ -1183,10 +1211,11 @@ def handle_command(chat, text):
         cfg["mode"] = "bypass" if cfg["mode"] == "plan" else "plan"; save_cfg()
         tg("sendMessage", chat_id=chat, text="Режим: " + MODES[cfg["mode"]])
     elif key == "stop":
-        for r in runs.values():
+        active = list(runs.values())
+        for r in active:
             r["stopped"] = True
             kill_run(r["proc"])
-        tg("sendMessage", chat_id=chat, text="⏹ Останавливаю." if runs else "Сейчас ничего не выполняется.")
+        tg("sendMessage", chat_id=chat, text="⏹ Остановлено." if active else "Сейчас ничего не выполняется.")
     elif key == "status":
         tg("sendMessage", chat_id=chat, text=status_text(chat), parse_mode="HTML")
     elif key == "where":
@@ -1364,6 +1393,8 @@ def on_message(msg, channel=False):
         return collect_media(msg, media)
     if not text:
         return
+    if not guest and re.fullmatch(r"(?i)\s*(стоп|stop|хватит|отмена|остановись|останови|cancel)[.!]*\s*", text):
+        text = "/stop"
     if text.startswith("/"):
         if guest and not text.startswith(("/help", "/start")):
             return
