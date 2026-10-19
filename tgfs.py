@@ -6,7 +6,7 @@
 в index.json (тоже документ в канале); его file_id спрятан в ссылке ⚙️ закрепа,
 поэтому после перезапуска бот восстанавливает всё через getChat.
 """
-import os, io, json, html, hashlib, re, requests
+import os, io, json, html, hashlib, re, time, requests
 
 SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv", ".cache", ".claude"}
 MAX_FILE = 45 * 1024 * 1024  # бот загружает до 50 МБ, скачивает до 20 МБ
@@ -32,7 +32,8 @@ class TgFS:
         self.cid = int(channel_id)
         self.ws = os.path.abspath(workspace)
         self.cache = cache_path
-        self.idx = {"files": {}, "dirs": {}, "dir_text": {}, "index_mid": None}
+        self.idx = {"files": {}, "dirs": {}, "dir_text": {}, "index_mid": None, "deleted": {}}
+        self._probe_pos = 0
         os.makedirs(self.ws, exist_ok=True)
 
     # ---------- Telegram helpers ----------
@@ -59,6 +60,7 @@ class TgFS:
         """Локальный кэш -> иначе index.json из закрепа -> иначе пустой канал."""
         if os.path.exists(self.cache):
             self.idx = json.load(open(self.cache))
+            self.idx.setdefault("deleted", {})
             return
         chat = self.call("getChat", chat_id=self.cid)
         pin = chat.get("pinned_message") or {}
@@ -66,6 +68,7 @@ class TgFS:
             m = re.search(r"[?&]idx=([\w-]+)", e.get("url", ""))
             if m:
                 self.idx = json.loads(self.download(m.group(1)))
+                self.idx.setdefault("deleted", {})
                 self._save_cache()
                 return
 
@@ -111,10 +114,13 @@ class TgFS:
             msg = self.call("sendDocument", chat_id=self.cid, caption=path,
                             disable_notification=True, files={"document": (name, data)})
         self.idx["files"][path] = {"mid": msg["message_id"], "fid": msg["document"]["file_id"], "sha": sha(data)}
+        self.idx.setdefault("deleted", {}).pop(path, None)
 
     def rm(self, path):
-        meta = self.idx["files"].pop(norm(path), None)
+        path = norm(path)
+        meta = self.idx["files"].pop(path, None)
         if meta:
+            self._mark_deleted(path, meta, "проект")
             try:
                 self.call("deleteMessage", chat_id=self.cid, message_id=meta["mid"])
             except RuntimeError:
@@ -148,6 +154,7 @@ class TgFS:
         os.makedirs(os.path.dirname(dst), exist_ok=True)
         open(dst, "wb").write(data)
         self.idx["files"][path] = {"mid": post["message_id"], "fid": doc["file_id"], "sha": sha(data)}
+        self.idx.setdefault("deleted", {}).pop(path, None)
         if old and old["mid"] != post["message_id"]:
             try:
                 self.call("deleteMessage", chat_id=self.cid, message_id=old["mid"])
@@ -156,10 +163,69 @@ class TgFS:
         self.rebuild_nav()
         return True
 
+    # ---------- удаления ----------
+    def _mark_deleted(self, path, meta, by):
+        self.idx.setdefault("deleted", {})[path] = {"mid": meta["mid"], "fid": meta.get("fid"),
+                                                    "sha": meta.get("sha"), "by": by,
+                                                    "at": time.strftime("%d.%m %H:%M", time.gmtime(time.time() + 5 * 3600))}
+
+    def alive(self, mid):
+        """True — сообщение есть, False — удалено, None — непонятно (лимит, нет прав)."""
+        try:
+            j = requests.post(self.api + "editMessageReplyMarkup", timeout=30,
+                              json={"chat_id": self.cid, "message_id": mid,
+                                    "reply_markup": {"inline_keyboard": []}}).json()
+        except Exception:
+            return None
+        d = (j.get("description") or "").lower()
+        if j.get("ok") or "not modified" in d:
+            return True
+        if "not found" in d or "message_id_invalid" in d:
+            return False
+        if j.get("error_code") == 429:
+            raise TimeoutError("429")
+        return None
+
+    def check_deleted(self, batch=15):
+        """Найти файлы, чьи сообщения удалили из канала: убрать путь и локальный файл,
+        но запомнить в index.json (раздел deleted) и показать в оглавлении со ссылкой.
+        batch=0 — проверить всё сразу."""
+        paths = sorted(self.idx["files"])
+        if not paths:
+            return []
+        if batch and batch < len(paths):
+            start = self._probe_pos % len(paths)
+            todo = (paths[start:] + paths[:start])[:batch]
+            self._probe_pos = start + batch
+        else:
+            todo = paths
+        gone = []
+        for p in todo:
+            try:
+                ok = self.alive(self.idx["files"][p]["mid"])
+            except TimeoutError:
+                break
+            if ok is False:
+                gone.append(p)
+            time.sleep(0.2)
+        for p in gone:
+            self._mark_deleted(p, self.idx["files"].pop(p), "канал")
+            full = os.path.join(self.ws, p)
+            try:
+                os.remove(full)
+                d = os.path.dirname(full)
+                while d.startswith(self.ws) and d != self.ws and not os.listdir(d):
+                    os.rmdir(d); d = os.path.dirname(d)
+            except OSError:
+                pass
+        if gone:
+            self.rebuild_nav()
+        return gone
+
     # ---------- навигация ----------
     def tree(self):
         dirs = {"": ([], [])}
-        for path in sorted(self.idx["files"]):
+        for path in sorted(set(self.idx["files"]) | set(self.idx.get("deleted", {}))):
             parts = path.split("/")
             for i in range(len(parts) - 1):
                 parent, d = "/".join(parts[:i]), "/".join(parts[:i + 1])
@@ -177,12 +243,22 @@ class TgFS:
             lines.append(f'<a href="{self.link(self.idx["dirs"][parent])}">⬆️ ..</a>')
         for s in subdirs:
             lines.append(f'📁 <a href="{self.link(self.idx["dirs"][s])}">{html.escape(s.split("/")[-1])}/</a>')
+        dels = self.idx.get("deleted", {})
         for f in files:
-            lines.append(f'📄 <a href="{self.link(self.idx["files"][f]["mid"])}">{html.escape(f.split("/")[-1])}</a>')
+            if f in self.idx["files"]:
+                lines.append(f'📄 <a href="{self.link(self.idx["files"][f]["mid"])}">{html.escape(f.split("/")[-1])}</a>')
+        gone = [f for f in files if f not in self.idx["files"] and f in dels]
+        if gone:
+            lines.append("\n🗑 <i>удалены:</i>")
+            for f in gone:
+                lines.append(f'<s><a href="{self.link(dels[f]["mid"])}">{html.escape(f.split("/")[-1])}</a></s>'
+                             f' <i>{html.escape(dels[f].get("at", ""))}</i>')
         if len(lines) == 1:
             lines.append("<i>пусто</i>")
         if index_fid:
-            lines.append(f'\n<a href="https://t.me/?idx={index_fid}">⚙️</a> файлов: {len(self.idx["files"])}')
+            nd = len(self.idx.get("deleted", {}))
+            lines.append(f'\n<a href="https://t.me/?idx={index_fid}">⚙️</a> файлов: {len(self.idx["files"])}'
+                         + (f" · удалено: {nd}" if nd else ""))
         text = "\n".join(lines)
         return text if len(text) < 4000 else text[:3990] + "\n…"
 
