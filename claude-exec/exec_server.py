@@ -115,6 +115,20 @@ def oidc_ok(token):
         return False
 
 
+def view_sig(job):
+    return hmac.new(TOKEN.encode(), ("view:" + job).encode(), hashlib.sha256).hexdigest()[:20]
+
+
+VIEW_HTML = """<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
+<title>Браузер модели</title><style>body{margin:0;background:#111;color:#bbb;font:14px system-ui;text-align:center}
+img{max-width:100%;height:auto;display:block;margin:0 auto}#s{padding:6px}</style></head><body>
+<div id=s>🌐 Браузер модели — задача __STATE__ · <span id=t>жду кадр…</span></div><img id=i>
+<script>let n=0;const i=document.getElementById('i'),t=document.getElementById('t');
+async function f(){try{const r=await fetch(location.pathname.replace(/[/]$/,'')+'/f.jpg?'+(n++),{cache:'no-store'});
+if(r.status==200){const b=await r.blob();const u=URL.createObjectURL(b);const o=i.src;i.src=u;if(o)URL.revokeObjectURL(o);
+t.textContent='обновлено '+new Date().toLocaleTimeString()}}catch(e){}setTimeout(f,700)}f();</script></body></html>"""
+
+
 def job_get(job, create=False):
     with JOBS_LOCK:
         now = time.time()
@@ -122,7 +136,8 @@ def job_get(job, create=False):
             JOBS.pop(k, None)
         if create and job not in JOBS:
             JOBS[job] = {"in": None, "ev": [], "done": False, "stop": False, "out": None,
-                         "t": now, "cv": threading.Condition(), "started": False, "msgs": [], "msg_n": 0}
+                         "t": now, "cv": threading.Condition(), "started": False, "msgs": [], "msg_n": 0,
+                         "frame": None, "frame_t": 0}
         return JOBS.get(job)
 
 
@@ -227,6 +242,9 @@ class H(BaseHTTPRequestHandler):
             new = j["msgs"][j["msg_n"]:]  # сообщения владельца, дописанные во время работы
             j["msg_n"] = len(j["msgs"])
             return self._send(200, {"stop": j["stop"], "msgs": new})
+        if runner and what == "frame" and m == "POST":  # кадр браузера модели для живого просмотра
+            j["frame"], j["frame_t"] = data, time.time()
+            return self._send(200, {"ok": True})
         if runner and what == "out" and m == "PUT":
             j["out"] = data
             return self._send(200, {"ok": True})
@@ -251,8 +269,24 @@ class H(BaseHTTPRequestHandler):
             return self._send(200, body, "application/gzip")
         return self._send(400, {"error": "bad request"})
 
+    def _view(self, path):
+        """/v/<job>/<sig>[/f.jpg] — живой просмотр браузера модели (только смотреть)."""
+        parts = path.strip("/").split("/")
+        if len(parts) < 3 or not hmac.compare_digest(parts[2], view_sig(parts[1])):
+            return self._send(404, {"error": "not found"})
+        j = job_get(parts[1])
+        if len(parts) > 3:
+            if not j or not j.get("frame"):
+                return self._send(204, b"", "image/jpeg")
+            return self._send(200, j["frame"], "image/jpeg", {"Cache-Control": "no-store"})
+        live = "идёт" if j else "задача закончилась"
+        page = VIEW_HTML.replace("__STATE__", live)
+        return self._send(200, page.encode(), "text/html; charset=utf-8")
+
     def _route(self):
         path = urlsplit(self.path).path
+        if path.startswith("/v/"):
+            return self._view(path)
         if path.startswith("/relay/"):
             return self._relay(path)
         if path.startswith("/s/") or path == "/s":
