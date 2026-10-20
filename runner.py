@@ -45,6 +45,7 @@ def call(method, path, data=None, ctype="application/json", timeout=60):
 
 # ---------- поток событий ----------
 out_buf, out_lock, stop = [], threading.Lock(), threading.Event()
+inbox = []  # сообщения владельца, дописанные во время работы (приходят в ответе реле на /ev)
 
 
 def emit(obj):
@@ -67,13 +68,16 @@ def pusher():
                 r = json.loads(call("POST", f"/relay/{JOB}/ev", "\n".join(batch).encode()))
                 if r.get("stop"):
                     stop.set()
+                inbox.extend(r.get("msgs") or [])
             except Exception:
                 with out_lock:
                     out_buf[:0] = batch
         elif not stop.is_set():
-            try:  # проверка кнопки Stop, даже когда событий нет
-                if json.loads(call("POST", f"/relay/{JOB}/ev", b"")).get("stop"):
+            try:  # проверка кнопки Stop и новых сообщений, даже когда событий нет
+                r = json.loads(call("POST", f"/relay/{JOB}/ev", b""))
+                if r.get("stop"):
                     stop.set()
+                inbox.extend(r.get("msgs") or [])
             except Exception:
                 pass
             time.sleep(1)
@@ -185,12 +189,47 @@ def main():
         env.pop(k, None)
     env.update(job["env"])
     env["HOME"] = home
+    for n in ("tgctl", "rexec", "tgmedia", "tgbrowser"):  # contents API не хранит бит исполнения
+        for d in (job["here"], os.path.dirname(os.path.abspath(__file__))):
+            try:
+                os.chmod(os.path.join(d, n), 0o755)
+            except OSError:
+                pass
     env["PATH"] = job["here"] + os.pathsep + os.path.join(home, ".local/bin") + os.pathsep + env.get("PATH", "")
     cmd = [claude] + job["cmd"][1:]
     status("Claude думает")
     since = time.time() - 2
+    streaming = bool(job.get("first"))  # --input-format stream-json: задачу и уточнения пишем в stdin
     p = subprocess.Popen(cmd, cwd=job["ws"], env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                         stdin=subprocess.DEVNULL, text=True, bufsize=1, start_new_session=True)
+                         stdin=subprocess.PIPE if streaming else subprocess.DEVNULL, text=True, bufsize=1,
+                         start_new_session=True)
+    sent = {"n": 0, "ack": 0}
+    wlock = threading.Lock()
+
+    def write(obj):
+        with wlock:
+            try:
+                p.stdin.write(json.dumps(obj, ensure_ascii=False) + "\n")
+                p.stdin.flush()
+                return True
+            except Exception:
+                return False
+
+    if streaming:
+        write(job["first"])
+
+        def feeder():
+            while p.poll() is None:
+                while inbox:
+                    m = inbox.pop(0)
+                    try:
+                        obj = json.loads(m)
+                    except ValueError:
+                        continue
+                    if write(obj):
+                        sent["n"] += 1
+                time.sleep(0.3)
+        threading.Thread(target=feeder, daemon=True).start()
 
     def watch_stop():
         stop.wait()
@@ -200,14 +239,26 @@ def main():
             pass
     threading.Thread(target=watch_stop, daemon=True).start()
     got_result = False
+    marker = job.get("marker", "\u0000")
     for line in p.stdout:
         emit(line.rstrip("\n"))
         try:
-            is_result = json.loads(line).get("type") == "result"
+            ev = json.loads(line)
         except Exception:
-            is_result = False
-        if is_result:
+            ev = {}
+        if ev.get("type") == "user" and not ev.get("parent_tool_use_id") and marker in json.dumps(ev, ensure_ascii=False):
+            sent["ack"] += 1  # уточнение дошло до модели (--replay-user-messages)
+        if ev.get("type") == "result":
             got_result = True
+            time.sleep(1.5)  # вдруг как раз пришло уточнение
+            if streaming and (inbox or sent["n"] > sent["ack"]):
+                continue  # модель ещё ответит на уточнение
+            if streaming:
+                with wlock:
+                    try:
+                        p.stdin.close()
+                    except Exception:
+                        pass
             break
     try:
         p.wait(timeout=10)
