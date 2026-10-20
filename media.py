@@ -152,7 +152,7 @@ def _hf(space, api, ext, out, **kw):
 
 
 # ---------------- AI Horde ----------------
-def _horde(prompt, nsfw, w, h, model, out, wait=900):
+def _horde(prompt, nsfw, w, h, model, out, wait=900, source=None):
     hdr = {"apikey": os.environ.get("HORDE_KEY", "0000000000"), "Client-Agent": "tg-claude-bot:1.0:anon"}
     models = [model] if model else HORDE_MODELS["nsfw" if nsfw else "sfw"]
     flux = any("Flux" in m for m in models)
@@ -170,6 +170,9 @@ def _horde(prompt, nsfw, w, h, model, out, wait=900):
                 "params": dict(params, seed=str(int(time.time()) + attempt))}
         if bad_workers:
             body.update(workers=bad_workers, worker_blacklist=True)
+        if source:  # img2img без цензуры: фото + промпт
+            body.update(source_image=base64.b64encode(open(source, "rb").read()).decode(), source_processing="img2img")
+            body["params"]["denoising_strength"] = 0.6
         path, wid = _horde_job(body, hdr, out, wait)
         if not _is_black(path):
             return _to_jpg(path)
@@ -218,7 +221,15 @@ def default(kind):
     return (p or "auto"), (m or None)
 
 
-def image(prompt, provider="auto", model=None, nsfw=False, size="1024x1024", out=None):
+def _data_uri(path):
+    ext = os.path.splitext(path)[1].lower().lstrip(".") or "png"
+    mime = "image/" + {"jpg": "jpeg"}.get(ext, ext)
+    return f"data:{mime};base64," + base64.b64encode(open(path, "rb").read()).decode()
+
+
+def image(prompt, provider="auto", model=None, nsfw=False, size="1024x1024", out=None, images=None):
+    """images — пути к фото для редактирования (image-to-image)."""
+    images = [i for i in (images or []) if i and os.path.exists(i)]
     w, h = (int(x) for x in re.findall(r"\d+", size or "1024x1024")[:2])
     if provider == "auto" and not model:
         provider, model = default("image")
@@ -242,7 +253,12 @@ def image(prompt, provider="auto", model=None, nsfw=False, size="1024x1024", out
                 args = {"prompt": prompt, "model": m, "ratio": {"w": w, "h": h}}
                 if m.startswith("gpt-image"):
                     args["quality"] = os.environ.get("PUTER_IMG_QUALITY", "low")  # бережём бесплатные $0.50/мес
+                if images:  # редактирование: GPT Image / Nano Banana принимают до 16 фото
+                    args["input_images"] = [_data_uri(i) for i in images[:5]]
                 return _puter("puter-image-generation", "ai-image", args, "png", out, 300)
+            if p == "hf" and images:
+                errs.append("hf: эта модель не умеет редактировать фото")
+                continue
             if p == "hf" and "nsfw" in model.lower():
                 return _to_jpg(_hf(HF_IMG_NSFW[0], HF_IMG_NSFW[1], "webp", out, prompt=prompt,
                                    negative_prompt="bad quality, worst quality, lowres, bad anatomy", seed=0,
@@ -254,7 +270,7 @@ def image(prompt, provider="auto", model=None, nsfw=False, size="1024x1024", out
                            width=min(w, 1024), height=min(h, 1024), num_inference_steps=4)
             if p == "horde":
                 return _horde(prompt, nsfw or "nsfw" in model.lower() or "pony" in model.lower(), w, h,
-                              model if p == provider and model else None, out)
+                              model if p == provider and model else None, out, source=images[0] if images else None)
         except Exception as e:
             errs.append(f"{p}: {str(e)[:300]}")
     raise RuntimeError("не получилось: " + " | ".join(errs))
@@ -272,11 +288,14 @@ def video(prompt, image_path=None, provider="auto", model=None, seconds=3, out=N
                     _progress("рисую первый кадр (Horde, без цензуры)…")
                     image_path = image(prompt, "horde", "ICBINP - I Can't Believe It's Not Photography", nsfw=True,
                                        size="1024x768")
-                _progress("оживляю кадр (Wan 2.2 без фильтра, HF)…")
+                _progress("оживляю кадр (Wan 2.2 без фильтра, HF ZeroGPU)…")
                 return _hf(HF_I2V_NSFW[0], HF_I2V_NSFW[1], "mp4", out, input_image=image_path, prompt=prompt, steps=6,
                            duration_seconds=min(float(seconds or 3), 5), randomize_seed=True)
+            if p == "hf" and model == "wan" and not image_path:  # Wan 2.2 — фото→видео: сначала рисуем кадр
+                _progress("рисую первый кадр (FLUX)…")
+                image_path = image(prompt, "hf", "flux-schnell", size="1024x576")
             if p == "hf":
-                if image_path and model != "ltx":
+                if image_path:
                     return _hf(HF_I2V[0], HF_I2V[1], "mp4", out, input_image=image_path, prompt=prompt, steps=6,
                                duration_seconds=min(float(seconds or 3), 5), randomize_seed=True)
                 return _hf(HF_T2V[0], HF_T2V[1], "mp4", out, prompt=prompt,
@@ -304,7 +323,8 @@ def main(argv):
     ap.add_argument("--model"), ap.add_argument("--provider", default="auto",
                                                  help="puter | hf | horde; без --model берётся модель из настроек бота")
     ap.add_argument("--nsfw", action="store_true"), ap.add_argument("--size", default="1024x1024")
-    ap.add_argument("--image"), ap.add_argument("--seconds", type=float, default=3)
+    ap.add_argument("--image", action="append", help="фото: для video — первый кадр, для image — редактирование (можно несколько)")
+    ap.add_argument("--seconds", type=float, default=3)
     ap.add_argument("-o", "--out")
     a = ap.parse_args(argv)
     if a.kind == "models":
@@ -312,9 +332,9 @@ def main(argv):
         return 0
     try:
         if a.kind == "image":
-            print(image(a.prompt, a.provider, a.model, a.nsfw, a.size, a.out))
+            print(image(a.prompt, a.provider, a.model, a.nsfw, a.size, a.out, images=a.image))
         else:
-            print(video(a.prompt, a.image, a.provider, a.model, a.seconds, a.out))
+            print(video(a.prompt, (a.image or [None])[0], a.provider, a.model, a.seconds, a.out))
         return 0
     except Exception as e:
         print("ошибка:", e, file=sys.stderr)
