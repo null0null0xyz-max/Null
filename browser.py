@@ -14,7 +14,8 @@ CLI (команда tgbrowser):
   tgbrowser tabs | tab N      — вкладки
   tgbrowser link              — ссылка для просмотра ещё раз
   tgbrowser close             — закрыть браузер (куки и входы сохранятся для следующего раза)
-Env: STEEL_API_KEY. Куки/логины сохраняются между сессиями (browser/context.json).
+Где работает: локальный Chromium на машине Claude (GitHub Actions; кадры идут в реле, ссылка TG_VIEW_URL),
+иначе Steel.dev (STEEL_API_KEY). Куки и входы сохраняются между запусками (browser/profile).
 """
 import os, re, sys, json, time, base64, subprocess
 
@@ -64,7 +65,7 @@ def notify(text, url=None):
 
 
 def alive(st):
-    if not st.get("id"):
+    if not st.get("id") or st.get("local"):
         return False
     try:
         r = requests.get(f"{API}/sessions/{st['id']}", headers=H(), timeout=20)
@@ -73,10 +74,67 @@ def alive(st):
         return False
 
 
+def find_chrome():
+    import shutil
+    for n in ("google-chrome", "google-chrome-stable", "chromium", "chromium-browser", "chrome"):
+        if shutil.which(n):
+            return shutil.which(n)
+    return None
+
+
+def local_ws():
+    try:
+        return json.loads(requests.get("http://127.0.0.1:9222/json/version", timeout=3).text)["webSocketDebuggerUrl"]
+    except Exception:
+        return None
+
+
+def open_local(quiet=False):
+    ws = local_ws()
+    fresh = not ws
+    if fresh:
+        chrome = find_chrome()
+        if not chrome:
+            return None
+        prof = os.path.join(DIR, "profile")
+        os.makedirs(prof, exist_ok=True)
+        for lock in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
+            try:
+                os.remove(os.path.join(prof, lock))
+            except OSError:
+                pass
+        subprocess.Popen([chrome, "--headless=new", "--remote-debugging-port=9222", "--remote-allow-origins=*",
+                          f"--user-data-dir={prof}", "--no-first-run", "--no-default-browser-check",
+                          "--window-size=1280,800", "--disable-dev-shm-usage", "--lang=ru-RU", "about:blank"],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        for _ in range(40):
+            time.sleep(0.5)
+            ws = local_ws()
+            if ws:
+                break
+    if not ws:
+        return None
+    st = {"id": "local", "ws": ws, "view": os.environ.get("TG_VIEW_URL", ""), "local": True}
+    save(st)
+    if fresh and not quiet and st["view"]:
+        notify("🌐 Модель открыла браузер — можно смотреть, что она делает.", st["view"])
+    return st
+
+
 def open_session(quiet=False):
     st = load()
-    if alive(st):
+    if st.get("local"):
+        st2 = open_local(quiet=True)
+        if st2:
+            return st2
+    elif alive(st):
         return st
+    if find_chrome() or not os.environ.get("STEEL_API_KEY"):
+        st2 = open_local(quiet)
+        if st2:
+            return st2
+        if not os.environ.get("STEEL_API_KEY"):
+            raise SystemExit("браузер недоступен здесь (нет Chromium и STEEL_API_KEY) — передай задачу Claude Code")
     body = {"timeout": 15 * 60 * 1000, "blockAds": True, "dimensions": {"width": 1280, "height": 800}}
     if os.path.exists(CTX):
         try:
@@ -199,6 +257,14 @@ def run(argv):
     cmd, args = argv[0], argv[1:]
     if cmd == "close":
         st = load()
+        if st.get("local"):
+            try:
+                c = CDP(st["ws"])
+                c.send("Browser.close", session=False, timeout=10)
+            except Exception:
+                pass
+            save({})
+            return "браузер закрыт, куки и входы сохранены в профиле"
         if st.get("id"):
             try:  # сохраняем куки/входы на следующий раз
                 ctx = requests.get(f"{API}/sessions/{st['id']}/context", headers=H(), timeout=30)
@@ -212,8 +278,9 @@ def run(argv):
         return "браузер закрыт, куки сохранены"
     if cmd == "link":
         st = open_session(quiet=True)
-        notify("🌐 Браузер модели:", st["view"])
-        return st["view"]
+        if st.get("view"):
+            notify("🌐 Браузер модели:", st["view"])
+        return st.get("view") or "ссылки для просмотра нет"
     st = open_session()
     c = CDP(st["ws"])
     try:
@@ -225,7 +292,8 @@ def run(argv):
             if args:
                 c.send("Page.navigate", {"url": args[0]})
                 c.wait_load()
-            return f"браузер открыт, владелец видит его по ссылке: {st['view']}\n" + (c.js("location.href") or "")
+            return (f"браузер открыт, владелец видит его по ссылке: {st['view']}\n" if st.get("view") else "браузер открыт\n") \
+                + (c.js("location.href") or "")
         if cmd == "goto":
             url = args[0] if re.match(r"^\w+://", args[0]) else "https://" + args[0]
             c.send("Page.navigate", {"url": url})
