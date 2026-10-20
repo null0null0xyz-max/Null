@@ -23,8 +23,43 @@ HORDE = "https://aihorde.net/api/v2"
 HF_IMAGE = ("black-forest-labs/FLUX.1-schnell", "/infer")
 HF_T2V = ("Lightricks/ltx-video-distilled", "/text_to_video")
 HF_I2V = ("zerogpu-aoti/wan2-2-fp8da-aoti-faster", "/generate_video")
+HF_I2V_NSFW = ("hf-Asdqqq/Uncensored-video2", "/generate_video")        # Wan 2.2 без фильтра, фото→видео
+HF_IMG_NSFW = ("IbarakiDouji/WAI-NSFW-illustrious-SDXL", "/generate")   # WAI-NSFW на ZeroGPU
 HORDE_MODELS = {"sfw": ["Flux.1-Schnell fp8 (Compact)", "Juggernaut XL", "AlbedoBase XL (SDXL)"],
-                "nsfw": ["WAI-NSFW-illustrious-SDXL", "CyberRealistic Pony", "Juggernaut XL"]}
+                "nsfw": ["WAI-NSFW-illustrious-SDXL", "ICBINP - I Can't Believe It's Not Photography", "CyberRealistic Pony"]}
+PROGRESS = None  # бот ставит сюда функцию(текст) — показывать очередь Horde
+
+
+def _progress(t):
+    try:
+        PROGRESS and PROGRESS(t)
+    except Exception:
+        pass
+
+
+def _is_black(path):
+    """Horde-воркеры иногда отдают пустой чёрный кадр — проверяем и переделываем."""
+    try:
+        from PIL import Image
+        im = Image.open(path).convert("L")
+        lo, hi = im.getextrema()
+        return hi < 12
+    except Exception:
+        return False
+
+
+def _to_jpg(path):
+    """webp → jpg: Telegram показывает webp как стикер/чёрный фон."""
+    try:
+        from PIL import Image
+        if path.endswith(".webp"):
+            j = path[:-5] + ".jpg"
+            Image.open(path).convert("RGB").save(j, quality=93)
+            os.remove(path)
+            return j
+    except Exception:
+        pass
+    return path
 
 MODELS_HELP = """Картинки:
   puter: gpt-image-2.5-flare, gpt-image-2.5-sunburst, gpt-image-2, gemini-nano-banana-2.1 (Nano Banana 2.1),
@@ -121,10 +156,36 @@ def _horde(prompt, nsfw, w, h, model, out, wait=900):
     hdr = {"apikey": os.environ.get("HORDE_KEY", "0000000000"), "Client-Agent": "tg-claude-bot:1.0:anon"}
     models = [model] if model else HORDE_MODELS["nsfw" if nsfw else "sfw"]
     flux = any("Flux" in m for m in models)
-    body = {"prompt": prompt, "nsfw": bool(nsfw), "censor_nsfw": False, "r2": True, "models": models,
-            "params": {"width": min(w, 1024) // 64 * 64, "height": min(h, 1024) // 64 * 64, "n": 1,
-                       "steps": 6 if flux else 25, "cfg_scale": 1 if flux else 6, "sampler_name": "k_euler"}}
-    r = requests.post(f"{HORDE}/generate/async", json=body, headers=hdr, timeout=60)
+    sd15 = any(k in m for m in models for k in ("ICBINP", "Deliberate", "Realistic Vision", "URPM", "Anything", "Hentai"))
+    side = 512 if sd15 else 832  # меньше размер — меньше kudos — быстрее очередь для анонима
+    ww, hh = (side, side) if w == h else ((side * 3 // 4) // 64 * 64, side) if h > w else (side, (side * 3 // 4) // 64 * 64)
+    params = {"width": ww, "height": hh, "n": 1}
+    if flux:
+        params.update(steps=4, cfg_scale=1, sampler_name="k_euler")
+    else:  # k_euler_a + clip_skip 2: с k_euler/dpmpp WAI-NSFW отдаёт чёрный кадр
+        params.update(steps=24, cfg_scale=6, sampler_name="k_euler_a", clip_skip=2)
+    bad_workers = []
+    for attempt in range(3):
+        body = {"prompt": prompt, "nsfw": bool(nsfw), "censor_nsfw": False, "r2": True, "models": models,
+                "params": dict(params, seed=str(int(time.time()) + attempt))}
+        if bad_workers:
+            body.update(workers=bad_workers, worker_blacklist=True)
+        path, wid = _horde_job(body, hdr, out, wait)
+        if not _is_black(path):
+            return _to_jpg(path)
+        os.remove(path)
+        bad_workers.append(wid)
+        _progress("воркер отдал чёрный кадр, переделываю…")
+    raise RuntimeError("horde: воркеры отдают пустые кадры, попробуй другую модель")
+
+
+def _horde_job(body, hdr, out, wait):
+    r = None
+    for _ in range(5):
+        r = requests.post(f"{HORDE}/generate/async", json=body, headers=hdr, timeout=60)
+        if r.status_code != 429:
+            break
+        time.sleep(2)
     if r.status_code not in (200, 202):
         raise RuntimeError(f"horde {r.status_code}: {r.text[:300]}")
     jid, t0 = r.json()["id"], time.time()
@@ -134,10 +195,19 @@ def _horde(prompt, nsfw, w, h, model, out, wait=900):
             raise RuntimeError("horde: задача не может быть выполнена")
         if c.get("done"):
             g = requests.get(f"{HORDE}/generate/status/{jid}", headers=hdr, timeout=60).json()["generations"][0]
-            return _save_any(g["img"], "", "webp", out)
+            return _save_any(g["img"], "", "webp", out), g.get("worker_id")
+        if c.get("processing"):
+            _progress("рисует воркер…")
+        else:
+            _progress(f"очередь Horde: место {c.get('queue_position', '?')}, ~{fmt_wait(c.get('wait_time'))}")
         time.sleep(6)
     requests.delete(f"{HORDE}/generate/status/{jid}", headers=hdr, timeout=30)
     raise RuntimeError("horde: очередь слишком длинная, не дождался")
+
+
+def fmt_wait(s):
+    s = int(s or 0)
+    return f"{s // 60} мин {s % 60} с" if s >= 60 else f"{s} с"
 
 
 # ---------------- общий интерфейс ----------------
@@ -173,6 +243,12 @@ def image(prompt, provider="auto", model=None, nsfw=False, size="1024x1024", out
                 if m.startswith("gpt-image"):
                     args["quality"] = os.environ.get("PUTER_IMG_QUALITY", "low")  # бережём бесплатные $0.50/мес
                 return _puter("puter-image-generation", "ai-image", args, "png", out, 300)
+            if p == "hf" and "nsfw" in model.lower():
+                return _to_jpg(_hf(HF_IMG_NSFW[0], HF_IMG_NSFW[1], "webp", out, prompt=prompt,
+                                   negative_prompt="bad quality, worst quality, lowres, bad anatomy", seed=0,
+                                   custom_width=1024, custom_height=1024, guidance_scale=6.0, num_inference_steps=24,
+                                   sampler="Euler a", model_name="v17", aspect_ratio_selector="Custom",
+                                   use_upscaler=False, upscaler_strength=0.55, upscale_by=1.5, add_quality_tags=True))
             if p == "hf":
                 return _hf(HF_IMAGE[0], HF_IMAGE[1], "webp", out, prompt=prompt, seed=0, randomize_seed=True,
                            width=min(w, 1024), height=min(h, 1024), num_inference_steps=4)
@@ -191,6 +267,14 @@ def video(prompt, image_path=None, provider="auto", model=None, seconds=3, out=N
     errs = []
     for p in order:
         try:
+            if p == "hf" and model == "nsfw":  # без цензуры: нет фото — сначала рисуем кадр в Horde, потом оживляем
+                if not image_path:
+                    _progress("рисую первый кадр (Horde, без цензуры)…")
+                    image_path = image(prompt, "horde", "ICBINP - I Can't Believe It's Not Photography", nsfw=True,
+                                       size="1024x768")
+                _progress("оживляю кадр (Wan 2.2 без фильтра, HF)…")
+                return _hf(HF_I2V_NSFW[0], HF_I2V_NSFW[1], "mp4", out, input_image=image_path, prompt=prompt, steps=6,
+                           duration_seconds=min(float(seconds or 3), 5), randomize_seed=True)
             if p == "hf":
                 if image_path and model != "ltx":
                     return _hf(HF_I2V[0], HF_I2V[1], "mp4", out, input_image=image_path, prompt=prompt, steps=6,
