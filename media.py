@@ -21,6 +21,7 @@ OUT_DIR = os.path.join(os.environ.get("WORKSPACE") or os.path.join(HERE, "worksp
 PUTER = "https://api.puter.com/drivers/call"
 HORDE = "https://aihorde.net/api/v2"
 HF_IMAGE = ("black-forest-labs/FLUX.1-schnell", "/infer")
+HF_LTX2 = ("Lightricks/LTX-2-3", "/generate_video")
 HF_T2V = ("Lightricks/ltx-video-distilled", "/text_to_video")
 HF_I2V = ("zerogpu-aoti/wan2-2-fp8da-aoti-faster", "/generate_video")
 HF_I2V_NSFW = ("hf-Asdqqq/Uncensored-video2", "/generate_video")        # Wan 2.2 без фильтра, фото→видео
@@ -67,7 +68,7 @@ MODELS_HELP = """Картинки:
   hf: flux-schnell
   horde (без цензуры, медленно): WAI-NSFW-illustrious-SDXL, CyberRealistic Pony, Juggernaut XL, Flux.1-Schnell fp8 (Compact)
 Видео:
-  hf: ltx (текст→видео, ~2–5 с), wan (картинка→видео, Wan 2.2)
+  hf: ltx2 (LTX-2.3, текст или фото→видео со звуком, по умолчанию), ltx (старый LTX 0.9), wan (картинка→видео, Wan 2.2)
   puter: видео бесплатных $0.50/мес не хватает (нужен платный баланс): wan2.7-t2v, dreamina-seedance-2-5-260628"""
 
 
@@ -221,6 +222,18 @@ def default(kind):
     return (p or "auto"), (m or None)
 
 
+def _en(prompt):
+    """Модели видео/SD понимают только английский: русский промпт они «не слышат» и рисуют что попало."""
+    if not re.search(r"[А-Яа-яЁё]", prompt or ""):
+        return prompt
+    try:
+        r = requests.get("https://translate.googleapis.com/translate_a/single",
+                         params={"client": "gtx", "sl": "auto", "tl": "en", "dt": "t", "q": prompt}, timeout=15)
+        return "".join(x[0] for x in r.json()[0] if x and x[0]) or prompt
+    except Exception:
+        return prompt
+
+
 def _data_uri(path):
     ext = os.path.splitext(path)[1].lower().lstrip(".") or "png"
     mime = "image/" + {"jpg": "jpeg"}.get(ext, ext)
@@ -230,6 +243,7 @@ def _data_uri(path):
 def image(prompt, provider="auto", model=None, nsfw=False, size="1024x1024", out=None, images=None):
     """images — пути к фото для редактирования (image-to-image)."""
     images = [i for i in (images or []) if i and os.path.exists(i)]
+    orig, prompt = prompt, _en(prompt)
     w, h = (int(x) for x in re.findall(r"\d+", size or "1024x1024")[:2])
     if provider == "auto" and not model:
         provider, model = default("image")
@@ -250,7 +264,7 @@ def image(prompt, provider="auto", model=None, nsfw=False, size="1024x1024", out
                 m = model if model and not model.startswith("flux") else "gpt-image-2.5-flare"
                 if m in ("nano-banana", "nano", "nanobanana"):
                     m = "gemini-nano-banana-2.1"
-                args = {"prompt": prompt, "model": m, "ratio": {"w": w, "h": h}}
+                args = {"prompt": orig, "model": m, "ratio": {"w": w, "h": h}}
                 if m.startswith("gpt-image"):
                     args["quality"] = os.environ.get("PUTER_IMG_QUALITY", "low")  # бережём бесплатные $0.50/мес
                 if images:  # редактирование: GPT Image / Nano Banana принимают до 16 фото
@@ -280,6 +294,7 @@ def video(prompt, image_path=None, provider="auto", model=None, seconds=3, out=N
     if provider == "auto" and not model:
         provider, model = default("video")
     order = [provider] if provider != "auto" else ["hf", "puter"]
+    orig, prompt = prompt, _en(prompt)
     errs = []
     for p in order:
         try:
@@ -291,6 +306,11 @@ def video(prompt, image_path=None, provider="auto", model=None, seconds=3, out=N
                 _progress("оживляю кадр (Wan 2.2 без фильтра, HF ZeroGPU)…")
                 return _hf(HF_I2V_NSFW[0], HF_I2V_NSFW[1], "mp4", out, input_image=image_path, prompt=prompt, steps=6,
                            duration_seconds=min(float(seconds or 3), 5), randomize_seed=True)
+            if p == "hf" and model in ("ltx2", "", None):  # LTX-2.3 от Lightricks: текст или фото → видео со звуком
+                _progress("генерирую LTX-2.3 (HF ZeroGPU)…")
+                return _hf(HF_LTX2[0], HF_LTX2[1], "mp4", out, input_image=image_path or None, prompt=prompt,
+                           duration=min(float(seconds or 4), 5), enhance_prompt=True, seed=0, randomize_seed=True,
+                           height=576, width=1024)
             if p == "hf" and model == "wan" and not image_path:  # Wan 2.2 — фото→видео: сначала рисуем кадр
                 _progress("рисую первый кадр (FLUX)…")
                 image_path = image(prompt, "hf", "flux-schnell", size="1024x576")
@@ -304,7 +324,7 @@ def video(prompt, image_path=None, provider="auto", model=None, seconds=3, out=N
                            mode="text-to-video", duration_ui=min(float(seconds or 3), 5), ui_frames_to_use=9,
                            seed_ui=42, randomize_seed=True, ui_guidance_scale=1, improve_texture_flag=True)
             if p == "puter":
-                args = {"prompt": prompt, "model": model or "wan2.7-t2v", "seconds": seconds}
+                args = {"prompt": orig, "model": model or "wan2.7-t2v", "seconds": seconds}
                 if image_path:
                     if os.path.exists(image_path):
                         args["input_reference"] = "data:image/png;base64," + base64.b64encode(open(image_path, "rb").read()).decode()
