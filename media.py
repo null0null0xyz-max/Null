@@ -156,8 +156,10 @@ def image(prompt, provider="auto", model=None, nsfw=False, size="1024x1024", out
                 m = model if model and not model.startswith("flux") else "gpt-image-2.5-flare"
                 if m in ("nano-banana", "nano", "nanobanana"):
                     m = "gemini-nano-banana-2.1"
-                return _puter("puter-image-generation", "ai-image",
-                              {"prompt": prompt, "model": m, "ratio": {"w": w, "h": h}}, "png", out, 300)
+                args = {"prompt": prompt, "model": m, "ratio": {"w": w, "h": h}}
+                if m.startswith("gpt-image"):
+                    args["quality"] = os.environ.get("PUTER_IMG_QUALITY", "low")  # бережём бесплатные $0.50/мес
+                return _puter("puter-image-generation", "ai-image", args, "png", out, 300)
             if p == "hf":
                 return _hf(HF_IMAGE[0], HF_IMAGE[1], "webp", out, prompt=prompt, seed=0, randomize_seed=True,
                            width=min(w, 1024), height=min(h, 1024), num_inference_steps=4)
