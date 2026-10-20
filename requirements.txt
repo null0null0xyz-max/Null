@@ -1,3 +1,4 @@
 requests
 gradio_client
 websocket-client
+Pillow
