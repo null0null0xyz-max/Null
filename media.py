@@ -33,7 +33,7 @@ MODELS_HELP = """Картинки:
   horde (без цензуры, медленно): WAI-NSFW-illustrious-SDXL, CyberRealistic Pony, Juggernaut XL, Flux.1-Schnell fp8 (Compact)
 Видео:
   hf: ltx (текст→видео, ~2–5 с), wan (картинка→видео, Wan 2.2)
-  puter: wan2.7-t2v (по умолчанию), seedance, veo-3.1 (дорого, тратит $0.50/мес)"""
+  puter: видео бесплатных $0.50/мес не хватает (нужен платный баланс): wan2.7-t2v, dreamina-seedance-2-5-260628"""
 
 
 def _out(ext, out=None):
@@ -46,6 +46,10 @@ def _out(ext, out=None):
 
 def _save_any(data, ctype, ext, out):
     """data: bytes, url, data-URI или dict с url/path."""
+    if isinstance(data, str) and data.startswith("data:") and not out:
+        m = re.match(r"data:\w+/(\w+)", data)
+        if m:
+            ext = {"jpeg": "jpg"}.get(m.group(1), m.group(1))
     path = _out(ext, out)
     if isinstance(data, dict):
         data = data.get("url") or data.get("path") or data.get("video") or data.get("image") or ""
@@ -137,8 +141,17 @@ def _horde(prompt, nsfw, w, h, model, out, wait=900):
 
 
 # ---------------- общий интерфейс ----------------
+def default(kind):
+    """Модель по умолчанию из настроек бота: MEDIA_IMAGE / MEDIA_VIDEO = 'провайдер|модель'."""
+    v = os.environ.get("MEDIA_" + kind.upper(), "")
+    p, _, m = v.partition("|")
+    return (p or "auto"), (m or None)
+
+
 def image(prompt, provider="auto", model=None, nsfw=False, size="1024x1024", out=None):
     w, h = (int(x) for x in re.findall(r"\d+", size or "1024x1024")[:2])
+    if provider == "auto" and not model:
+        provider, model = default("image")
     model = (model or "").strip()
     if provider == "auto":
         if nsfw:
@@ -164,19 +177,22 @@ def image(prompt, provider="auto", model=None, nsfw=False, size="1024x1024", out
                 return _hf(HF_IMAGE[0], HF_IMAGE[1], "webp", out, prompt=prompt, seed=0, randomize_seed=True,
                            width=min(w, 1024), height=min(h, 1024), num_inference_steps=4)
             if p == "horde":
-                return _horde(prompt, nsfw, w, h, model if p == provider else None, out)
+                return _horde(prompt, nsfw or "nsfw" in model.lower() or "pony" in model.lower(), w, h,
+                              model if p == provider and model else None, out)
         except Exception as e:
             errs.append(f"{p}: {str(e)[:300]}")
     raise RuntimeError("не получилось: " + " | ".join(errs))
 
 
 def video(prompt, image_path=None, provider="auto", model=None, seconds=3, out=None):
+    if provider == "auto" and not model:
+        provider, model = default("video")
     order = [provider] if provider != "auto" else ["hf", "puter"]
     errs = []
     for p in order:
         try:
             if p == "hf":
-                if image_path:
+                if image_path and model != "ltx":
                     return _hf(HF_I2V[0], HF_I2V[1], "mp4", out, input_image=image_path, prompt=prompt, steps=6,
                                duration_seconds=min(float(seconds or 3), 5), randomize_seed=True)
                 return _hf(HF_T2V[0], HF_T2V[1], "mp4", out, prompt=prompt,
@@ -201,7 +217,8 @@ def main(argv):
     ap = argparse.ArgumentParser(prog="tgmedia", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("kind", choices=["image", "video", "models"])
     ap.add_argument("prompt", nargs="?", default="")
-    ap.add_argument("--model"), ap.add_argument("--provider", default="auto")
+    ap.add_argument("--model"), ap.add_argument("--provider", default="auto",
+                                                 help="puter | hf | horde; без --model берётся модель из настроек бота")
     ap.add_argument("--nsfw", action="store_true"), ap.add_argument("--size", default="1024x1024")
     ap.add_argument("--image"), ap.add_argument("--seconds", type=float, default=3)
     ap.add_argument("-o", "--out")
