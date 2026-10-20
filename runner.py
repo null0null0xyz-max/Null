@@ -12,7 +12,8 @@ import urllib.request, urllib.error
 JOB, RELAY = os.environ["JOB"], os.environ["RELAY"].rstrip("/")
 ECC_URL = "https://codeload.github.com/affaan-m/ECC/tar.gz/refs/heads/main"
 ECC_PARTS = ("commands/", "agents/", "skills/", "rules/common/")
-SKIP = {".git", "node_modules", "__pycache__", ".venv", "venv", ".cache"}
+SKIP = {".git", "node_modules", "__pycache__", ".venv", "venv", ".cache", "Cache", "Code Cache", "GPUCache",
+        "Service Worker", "GrShaderCache", "ShaderCache", "component_crx_cache"}
 CLAUDE_SKIP = {"shell-snapshots", "statsig", "todos", "ide", "cache", "local", "downloads",
                "debug", "telemetry", "logs", "plugins"}
 
@@ -81,6 +82,47 @@ def pusher():
             except Exception:
                 pass
             time.sleep(1)
+
+
+def frames():
+    """Если модель запустила локальный Chromium (tgbrowser), шлём его кадры в реле — владелец смотрит по ссылке."""
+    try:
+        import websocket
+    except ImportError:
+        sh("pip install -q websocket-client")
+        try:
+            import websocket
+        except ImportError:
+            return
+    ws, n = None, 0
+    while not stop.is_set():
+        try:
+            if ws is None:
+                pages = [t for t in json.loads(urllib.request.urlopen("http://127.0.0.1:9222/json", timeout=3).read())
+                         if t.get("type") == "page"]
+                if not pages:
+                    time.sleep(2); continue
+                ws = websocket.create_connection(pages[-1]["webSocketDebuggerUrl"], timeout=20, suppress_origin=True)
+                t_conn = time.time()
+            n += 1
+            ws.send(json.dumps({"id": n, "method": "Page.captureScreenshot", "params": {"format": "jpeg", "quality": 55}}))
+            while True:
+                m = json.loads(ws.recv())
+                if m.get("id") == n:
+                    break
+            data = (m.get("result") or {}).get("data")
+            if data:
+                call("POST", f"/relay/{JOB}/frame", base64.b64decode(data), "image/jpeg", timeout=20)
+            if time.time() - t_conn > 8:  # переподключаемся — вдруг открыта новая вкладка
+                ws.close(); ws = None
+            time.sleep(0.8)
+        except Exception:
+            try:
+                ws and ws.close()
+            except Exception:
+                pass
+            ws = None
+            time.sleep(2)
 
 
 def flush():
@@ -197,6 +239,7 @@ def main():
                 pass
     env["PATH"] = job["here"] + os.pathsep + os.path.join(home, ".local/bin") + os.pathsep + env.get("PATH", "")
     cmd = [claude] + job["cmd"][1:]
+    threading.Thread(target=frames, daemon=True).start()
     status("Claude думает")
     since = time.time() - 2
     streaming = bool(job.get("first"))  # --input-format stream-json: задачу и уточнения пишем в stdin
