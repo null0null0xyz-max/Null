@@ -122,7 +122,7 @@ def job_get(job, create=False):
             JOBS.pop(k, None)
         if create and job not in JOBS:
             JOBS[job] = {"in": None, "ev": [], "done": False, "stop": False, "out": None,
-                         "t": now, "cv": threading.Condition(), "started": False}
+                         "t": now, "cv": threading.Condition(), "started": False, "msgs": [], "msg_n": 0}
         return JOBS.get(job)
 
 
@@ -224,7 +224,9 @@ class H(BaseHTTPRequestHandler):
                             if line.startswith('{"type": "_done"') or line.startswith('{"type":"_done"'):
                                 j["done"] = True
                 cv.notify_all()
-            return self._send(200, {"stop": j["stop"]})
+            new = j["msgs"][j["msg_n"]:]  # сообщения владельца, дописанные во время работы
+            j["msg_n"] = len(j["msgs"])
+            return self._send(200, {"stop": j["stop"], "msgs": new})
         if runner and what == "out" and m == "PUT":
             j["out"] = data
             return self._send(200, {"ok": True})
@@ -236,6 +238,9 @@ class H(BaseHTTPRequestHandler):
                 lines = j["ev"][frm:]
             return self._send(200, {"lines": lines, "next": frm + len(lines), "done": j["done"],
                                     "started": j["started"]})
+        if bot and what == "msg" and m == "POST":
+            j["msgs"].append(data.decode(errors="replace"))
+            return self._send(200, {"ok": True, "queued": len(j["msgs"]) - j["msg_n"]})
         if bot and what == "stop" and m == "POST":
             j["stop"] = True
             return self._send(200, {"ok": True})
