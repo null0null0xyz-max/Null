@@ -25,6 +25,16 @@ def sha(data):
     return hashlib.sha256(data).hexdigest()
 
 
+
+def fid_of(msg):
+    """Telegram иногда превращает файл в фото/видео — тогда ключа "document" нет."""
+    for k in ("document", "video", "animation", "audio", "voice"):
+        if isinstance(msg.get(k), dict):
+            return msg[k]["file_id"]
+    if msg.get("photo"):
+        return msg["photo"][-1]["file_id"]
+    return None
+
 class TgFS:
     def __init__(self, token, channel_id, workspace, cache_path="index.json"):
         self.api = f"https://api.telegram.org/bot{token}/"
@@ -112,8 +122,9 @@ class TgFS:
                 gone = True  # сообщение удалили руками — пришлём заново
         if gone:
             msg = self.call("sendDocument", chat_id=self.cid, caption=path,
-                            disable_notification=True, files={"document": (name, data)})
-        self.idx["files"][path] = {"mid": msg["message_id"], "fid": msg["document"]["file_id"], "sha": sha(data)}
+                            disable_notification=True, disable_content_type_detection=True,
+                            files={"document": (name, data)})
+        self.idx["files"][path] = {"mid": msg["message_id"], "fid": fid_of(msg), "sha": sha(data)}
         self.idx.setdefault("deleted", {}).pop(path, None)
 
     def rm(self, path):
@@ -316,5 +327,5 @@ class TgFS:
             self.idx["index_mid"] = msg["message_id"]
         if not isinstance(msg, dict):  # «not modified» — файл тот же
             return self.idx.get("index_fid")
-        self.idx["index_fid"] = msg["document"]["file_id"]
+        self.idx["index_fid"] = fid_of(msg)
         return self.idx["index_fid"]
