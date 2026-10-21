@@ -67,40 +67,66 @@ def kind_of(path):
     return "document", "document"
 
 
+NATIVE = {"photo": ("sendPhoto", "photo"), "animation": ("sendAnimation", "animation"),
+          "video": ("sendVideo", "video"), "audio": ("sendAudio", "audio"),
+          "voice_note": ("sendVoice", "voice"), "document": ("sendDocument", "document")}
+
+
+def send_files(chat, items, extra=None):
+    """Файлы обычными sendPhoto/sendVideo/sendDocument: медиа внутри rich-сообщения Telegram
+    стал показывать чёрным квадратом, поэтому текст идёт rich-сообщением, а файлы — отдельно."""
+    extra = extra or {}
+    group = [(f, c, t) for f, c, t in items if t in ("photo", "video")]
+    rest = [(f, c, t) for f, c, t in items if t not in ("photo", "video")]
+    if len(group) >= 2:
+        for i in range(0, len(group), 10):
+            chunk, files, media = group[i:i + 10], {}, []
+            for j, (full, cap, t) in enumerate(chunk):
+                files[f"m{j}"] = (os.path.basename(full), open(full, "rb"))
+                media.append({"type": t, "media": f"attach://m{j}", "caption": (cap or "")[:1000]})
+            r = call("sendMediaGroup", files=files, chat_id=chat, media=media, **extra)
+            if not r.get("ok"):
+                rest += chunk
+        group = []
+    for full, cap, t in group + rest:
+        if t == "photo" and os.path.getsize(full) > 9_500_000:
+            t = "document"
+        m, field = NATIVE[t]
+        r = call(m, files={field: (os.path.basename(full), open(full, "rb"))}, chat_id=chat,
+                 caption=(cap or "")[:1000], **extra)
+        if not r.get("ok") and t != "document":
+            call("sendDocument", files={"document": (os.path.basename(full), open(full, "rb"))}, chat_id=chat,
+                 caption=(cap or "")[:1000], **extra)
+
+
 def rich_send(chat, md, base, reply_to=None, files_sent=None):
-    """Rich-сообщение (Markdown). Локальные файлы ![..](file:путь) загружаются как медиа."""
-    media, files = [], {}
+    """Rich-сообщение (Markdown). Локальные файлы ![..](file:путь) уходят следом обычными медиа-сообщениями."""
+    items = []
 
     def repl(m):
         path = m.group(2)
         if path.startswith(("http://", "https://", "tg://")):
             return m.group(0)
         full = path if os.path.isabs(path) else os.path.join(base, path)
-        if not os.path.isfile(full) or len(media) >= 50:
+        if not os.path.isfile(full) or len(items) >= 50:
             return m.group(0)
-        mid = f"f{len(media) + 1}"
-        itype, link = kind_of(full)
-        media.append({"id": mid, "media": {"type": itype, "media": "attach://" + mid}})
-        files[mid] = (os.path.basename(full), open(full, "rb"))
-        return f"![{m.group(1)}](tg://{link}?id={mid}{m.group(3) or ''})"
+        items.append((full, m.group(1), kind_of(full)[0]))
+        return ""
 
-    body = MEDIA_RE.sub(repl, md)
-    rm = {"markdown": body}
-    if media:
-        rm["media"] = media
+    body = MEDIA_RE.sub(repl, md).strip()
     extra = {"reply_parameters": {"message_id": reply_to, "allow_sending_without_reply": True}} if reply_to else {}
-    r = call("sendRichMessage", files=files or None, chat_id=chat, rich_message=rm, **extra)
-    if r.get("ok"):
-        log_msg(chat, r["result"]["message_id"], "bot", md)
-        return r
-    # запасной путь: простой текст + файлы отдельно
-    plain = re.sub(r"<[^>]+>", "", MEDIA_RE.sub("", md)).strip() or "📎"
-    for i in range(0, len(plain), 4000):
-        r2 = call("sendMessage", chat_id=chat, text=plain[i:i + 4000], **extra)
-    for name, fh in files.values():
-        fh.seek(0)
-        call("sendDocument", chat_id=chat, files={"document": (name, fh)})
-    return r2 if plain else r
+    r = {"ok": True}
+    if body:
+        r = call("sendRichMessage", chat_id=chat, rich_message={"markdown": body}, **extra)
+        if r.get("ok"):
+            log_msg(chat, r["result"]["message_id"], "bot", md)
+        else:  # запасной путь: простой текст
+            plain = re.sub(r"<[^>]+>", "", body).strip()
+            for i in range(0, len(plain), 4000):
+                r = call("sendMessage", chat_id=chat, text=plain[i:i + 4000], **extra)
+    if items:
+        send_files(chat, items, extra if not body else None)
+    return r
 
 
 def main(argv):
