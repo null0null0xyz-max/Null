@@ -74,7 +74,7 @@ function splitPathKey(pathname) {
 
 // ---------- rate limiting ----------
 const hits = new Map(); // key -> { count, windowStart }
-function rateLimited(key) {
+function rateLimitRetryAfter(key) {
   const now = Date.now();
   const win = 60_000;
   let rec = hits.get(key);
@@ -83,7 +83,7 @@ function rateLimited(key) {
     hits.set(key, rec);
   }
   rec.count += 1;
-  return rec.count > RATE_LIMIT;
+  return rec.count > RATE_LIMIT ? Math.ceil((win - (now - rec.windowStart)) / 1000) : 0;
 }
 setInterval(() => {
   const now = Date.now();
@@ -171,7 +171,7 @@ const server = http.createServer((req, res) => {
   if (req.method === "OPTIONS") {
     res.writeHead(204, {
       "access-control-allow-origin": "*",
-      "access-control-allow-methods": "GET, POST, OPTIONS",
+      "access-control-allow-methods": [...new Set([...ALLOWED_METHODS, "OPTIONS"])].join(", "),
       "access-control-allow-headers":
         "Authorization, Content-Type, x-api-key, OpenAI-Organization, OpenAI-Project, Anthropic-Version",
       "access-control-max-age": "86400",
@@ -216,7 +216,10 @@ const server = http.createServer((req, res) => {
       json(res, 401, { error: { message: "Invalid or missing API key", type: "invalid_request_error" } });
       return;
     }
-    if (rateLimited(key)) {
+    const retryAfter = rateLimitRetryAfter(key);
+    if (retryAfter) {
+      res.setHeader("retry-after", String(retryAfter));
+      res.setHeader("access-control-expose-headers", "Retry-After");
       json(res, 429, { error: { message: "Rate limit exceeded", type: "rate_limit_error" } });
       return;
     }
@@ -225,7 +228,7 @@ const server = http.createServer((req, res) => {
   if (!pathname || pathname === "/" || pathname === "/v1" || pathname === "/v1/") {
     json(res, 404, {
       error: {
-        message: "Append an upstream path after the key, e.g. " + UPSTREAM_URL.replace(/^[a-z]+:\/\//i, "") + "/chat/completions",
+        message: "Append an endpoint to this proxy URL, e.g. /chat/completions with an Authorization: Bearer <KEY> header, or /api/<KEY>/chat/completions.",
         type: "invalid_request_error",
       },
     });
