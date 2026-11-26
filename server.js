@@ -109,8 +109,10 @@ function pipeProxy(req, res, suffix, query) {
   if (SERVER_KEY) headers.authorization = `Bearer ${SERVER_KEY}`;
 
   const abort = new AbortController();
-  const onClientClose = () => abort.abort();
-  req.on("close", onClientClose);
+  // Request close also fires on normal completion; only abort a disconnected response.
+  res.on("close", () => {
+    if (!res.writableEnded) abort.abort();
+  });
 
   const upReq = transport.request(
     full,
