@@ -46,9 +46,9 @@ The path-embedded form is the phone-friendly one: put your key between `/api/` a
 ## What's protected
 
 - API-key auth via timing-safe comparison, no keys in logs
-- Per-key rate limit (`RATE_LIMIT` req/min, 429 on exceed)
+- Per-key rate limit (`RATE_LIMIT` req/min, 429 on exceed with a browser-readable `Retry-After` header in seconds)
 - Request body cap (`MAX_BODY_BYTES`) without buffering whole bodies
-- Only `GET`/`POST` allowed by default (`ALLOWED_METHODS` to change)
+- Only `GET`/`POST` allowed by default (`ALLOWED_METHODS` to change; CORS preflight reflects the configured methods)
 - Path allowlist regex (`ALLOW_PATH_REGEX`), path traversal blocked by URL parsing
 - Streaming responses passthrough (SSE works, e.g. `"stream": true`)
 - Hop-by-hop headers stripped in both directions; `?key=` never forwarded upstream
